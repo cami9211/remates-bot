@@ -1,30 +1,21 @@
 """
-Bot de oportunidades de remates judiciales en Colombia (SIN IA, 100% gratis)
+Bot de edictos judiciales - Clasificados El Colombiano (SIN IA, 100% gratis)
 --------------------------------------------------------------------------------
-Combina dos fuentes, ambas leídas directamente sin ninguna API de IA:
+Fuente única: Clasificados "Judiciales / Edictos" de El Colombiano
+(masificados.com), leída directamente sin ninguna API de IA.
 
-  1. Banco Agrario de Colombia (bancoagrario.gov.co/remates-judiciales)
-     -> Datos estructurados: avalúo, postura, fecha, juzgado, bien.
+  https://www.masificados.com/otros/avisos/judiciales/edictos
 
-  2. Avisos Masificados de El Colombiano - Judiciales / Edictos
-     (masificados.com/otros/avisos/judiciales/edictos)
-     -> Listado de edictos, emplazamientos, avisos de remate, avisos de
-     liquidación patrimonial, etc. publicados por juzgados y notarías,
-     mayoritariamente de Antioquia. Se recorre ordenado del más nuevo al
-     más antiguo (order_search=date_desc) y solo se conservan los avisos
-     recientes. Para cada aviso reciente se entra también a su página de
-     detalle para sacar el texto completo (no el fragmento truncado) e
-     intentar identificar el despacho y el radicado, buscando quedar al
-     mismo nivel de detalle que la sección del Banco Agrario.
+El listado se revisa página por página (más recientes primero) y para
+cada aviso se abre su página de detalle para extraer el texto completo
+del edicto (el listado solo muestra un resumen truncado).
 
 Variables de entorno requeridas (Secrets en GitHub):
   GMAIL_USER, GMAIL_APP_PASSWORD, RECIPIENT_EMAIL
 
 Opcional:
-  MAX_PAGES_BANCO_AGRARIO   -> páginas del Banco Agrario a revisar (default 5)
-  MAX_PAGES_MASIFICADOS     -> páginas de Masificados a revisar (default 5)
-  MASIFICADOS_DIAS_ATRAS    -> qué tan "reciente" es reciente, en días (default 1)
-  MASIFICADOS_MAX_DETALLES  -> tope de páginas de detalle a abrir por corrida (default 40)
+  MAX_PAGINAS_EDICTOS -> páginas del listado a revisar (default 2, 50 avisos c/u)
+  MAX_AVISOS          -> tope de avisos a abrir en detalle (default 60)
 """
 
 import os
@@ -40,12 +31,10 @@ from email.mime.text import MIMEText
 GMAIL_USER = os.environ.get("GMAIL_USER")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
 RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", GMAIL_USER)
-MAX_PAGES_BANCO_AGRARIO = int(os.environ.get("MAX_PAGES_BANCO_AGRARIO", "5"))
-MAX_PAGES_MASIFICADOS = int(os.environ.get("MAX_PAGES_MASIFICADOS", "5"))
-MASIFICADOS_DIAS_ATRAS = int(os.environ.get("MASIFICADOS_DIAS_ATRAS", "1"))
-MASIFICADOS_MAX_DETALLES = int(os.environ.get("MASIFICADOS_MAX_DETALLES", "40"))
+MAX_PAGINAS_EDICTOS = int(os.environ.get("MAX_PAGINAS_EDICTOS", "2"))
+MAX_AVISOS = int(os.environ.get("MAX_AVISOS", "60"))
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (remates-bot; uso personal)"}
+HEADERS = {"User-Agent": "Mozilla/5.0 (edictos-bot; uso personal)"}
 
 
 def descargar(url: str) -> str:
@@ -62,336 +51,142 @@ def html_a_texto(html: str) -> str:
     texto = texto.replace("&nbsp;", " ").replace("&amp;", "&")
     texto = re.sub(r"[ \t]+", " ", texto)
     texto = re.sub(r"\n{2,}", "\n\n", texto)
-    return texto
+    return texto.strip()
 
 
-def parse_fecha(s):
-    if not s:
-        return None
-    s = s.strip()
-    m = re.search(r"(\d{1,2})[/-](\d{1,2})[/-](\d{4})", s)
-    if m:
-        dia, mes, anio = m.groups()
+# =========================================================================
+# CLASIFICADOS EL COLOMBIANO - JUDICIALES / EDICTOS
+# =========================================================================
+
+BASE_URL_EDICTOS = "https://www.masificados.com/otros/avisos/judiciales/edictos"
+
+# Cada aviso vive en /otros/ocasional/{id_categoria}/aviso/{id_aviso}/
+AVISO_URL_RE = re.compile(r"/otros/ocasional/(\d+)/aviso/(\d+)/")
+
+FECHA_PUBLICADO_RE = re.compile(r"Publicado:\s*(\d{2})/(\d{2})/(\d{4})")
+OG_DESCRIPTION_RE = re.compile(
+    r'<meta[^>]*property=["\']og:description["\'][^>]*content=["\'](.*?)["\']\s*/?>',
+    re.S | re.I,
+)
+RADICADO_RE = re.compile(r"radicad[oa]\s*(?:no\.?|número)?\s*:?\s*([0-9][0-9\-\.]{8,30})", re.I)
+
+
+def listar_ids_avisos():
+    """Recorre las páginas del listado (ya viene ordenado por más recientes)
+    y devuelve los IDs de aviso en el mismo orden, sin duplicados."""
+    ids_vistos = []
+    ids_set = set()
+    for pagina in range(1, MAX_PAGINAS_EDICTOS + 1):
+        url_pagina = f"{BASE_URL_EDICTOS}?max_per_page=50&search_results_view=lineal&page={pagina}"
         try:
-            return datetime.date(int(anio), int(mes), int(dia))
-        except ValueError:
-            return None
-    return None
+            html = descargar(url_pagina)
+        except Exception as e:
+            print(f"[Edictos] Error en página {pagina}: {e}")
+            break
+        encontrados = AVISO_URL_RE.findall(html)
+        if not encontrados:
+            break
+        for _id_categoria, id_aviso in encontrados:
+            if id_aviso not in ids_set:
+                ids_set.add(id_aviso)
+                ids_vistos.append(id_aviso)
+        if len(ids_vistos) >= MAX_AVISOS:
+            break
+    return ids_vistos[:MAX_AVISOS]
 
 
-# =========================================================================
-# FUENTE 1: BANCO AGRARIO
-# =========================================================================
-
-BASE_URL_BANAGRARIO = "https://www.bancoagrario.gov.co/remates-judiciales"
-
-MESES = {
-    "enero": 1, "febrero": 2, "marzo": 3, "abril": 4, "mayo": 5, "junio": 6,
-    "julio": 7, "agosto": 8, "septiembre": 9, "setiembre": 9, "octubre": 10,
-    "noviembre": 11, "diciembre": 12,
-}
-
-LISTING_SPLIT = re.compile(r"PERMITE INFORMAR A QUIEN INTERESE", re.I)
-
-
-def parse_fecha_larga(s):
-    if not s:
-        return None
-    s = s.strip().lower()
-    m = re.search(r"(\d{1,2})\s*(?:de)?\s*([a-záéíóú]+)\s*(?:de)?\s*(\d{4})", s)
-    if m:
-        dia, mes_txt, anio = m.groups()
-        mes = MESES.get(mes_txt.strip())
-        if mes:
-            try:
-                return datetime.date(int(anio), mes, int(dia))
-            except ValueError:
-                return None
-    return parse_fecha(s)
-
-
-def campo(label: str, texto: str):
-    m = re.search(rf"{label}\**[ \t]*:[ \t\*]*([^\n]+)", texto, re.I)
-    return m.group(1).strip() if m else None
-
-
-def campo_multilinea(label: str, texto: str, maxlen=350):
-    m = re.search(rf"{label}\**[ \t]*:?[ \t\*]*\n*(.+)", texto, re.I | re.S)
+def parse_fecha_publicado(html):
+    m = FECHA_PUBLICADO_RE.search(html)
     if not m:
         return None
-    resto = m.group(1)
-    parrafo = re.split(r"\n\s*\n", resto.strip())[0]
-    parrafo = re.sub(r"\s+", " ", parrafo).strip(" *")
-    return parrafo[:maxlen]
-
-
-def extraer_listados_banagrario(texto: str, page_num: int):
-    bloques = LISTING_SPLIT.split(texto)[1:]
-    listados = []
-    for bloque in bloques:
-        avaluo_m = re.search(r"avalúo[:\s]*\$?\s*([\d\.,]+)", bloque, re.I)
-        postura_m = re.search(r"postura[:\s]*\$?\s*([\d\.,]+)", bloque, re.I)
-        fecha_txt = campo(r"FECHA\s*(?:DE)?\s*REMATE", bloque)
-        juzgado = campo("JUZGADO", bloque)
-        radicacion = campo(r"RADICACI[OÓ]N", bloque)
-        bien = campo_multilinea(r"BIEN A REMATAR", bloque)
-        listados.append({
-            "avaluo": avaluo_m.group(1).strip() if avaluo_m else None,
-            "postura": postura_m.group(1).strip() if postura_m else None,
-            "fecha_remate_texto": fecha_txt or "No especificada",
-            "fecha_remate": parse_fecha_larga(fecha_txt),
-            "juzgado": juzgado or "No especificado",
-            "radicacion": radicacion or "No especificada",
-            "bien": bien or "Descripción no disponible",
-            "link": f"{BASE_URL_BANAGRARIO}?page={page_num}",
-        })
-    return listados
-
-
-def calcular_descuento(avaluo_str, postura_str):
-    def a_numero(s):
-        if not s:
-            return None
-        try:
-            return float(s.replace(".", "").replace(",", "."))
-        except ValueError:
-            return None
-    a = a_numero(avaluo_str)
-    p = a_numero(postura_str)
-    if a and p and a > 0:
-        return round((p / a) * 100, 1)
-    return None
-
-
-def recolectar_banagrario():
-    todos = []
-    for page_num in range(MAX_PAGES_BANCO_AGRARIO):
-        try:
-            html = descargar(f"{BASE_URL_BANAGRARIO}?page={page_num}")
-        except Exception as e:
-            print(f"[Banco Agrario] Error en página {page_num}: {e}")
-            break
-        texto = html_a_texto(html)
-        listados = extraer_listados_banagrario(texto, page_num)
-        if not listados:
-            break
-        todos.extend(listados)
-
-    hoy = datetime.date.today()
-    vigentes = [r for r in todos if r["fecha_remate"] is None or r["fecha_remate"] >= hoy]
-    vistos, unicos = set(), []
-    for r in vigentes:
-        if r["radicacion"] not in vistos:
-            vistos.add(r["radicacion"])
-            unicos.append(r)
-    unicos.sort(key=lambda r: (r["fecha_remate"] is None, r["fecha_remate"] or hoy))
-    return unicos
-
-
-# =========================================================================
-# FUENTE 2: AVISOS MASIFICADOS (El Colombiano) - Judiciales / Edictos
-# =========================================================================
-
-BASE_URL_MASIFICADOS = "https://www.masificados.com/otros/avisos/judiciales/edictos"
-
-# Patrones para identificar despacho/radicado dentro del texto completo del
-# aviso. Son heurísticas sobre texto libre (cada juzgado/notaría redacta su
-# edicto a su manera), así que no siempre van a acertar con precisión total,
-# pero cubren el vocabulario típico usado en estos avisos.
-PATRON_DESPACHO = re.compile(
-    r"(JUZGADO[^.,;\n]{0,90}|NOTAR[IÍ]A[^.,;\n]{0,90}|TRIBUNAL[^.,;\n]{0,90}|"
-    r"NOTAR[IÍ]O[^.,;\n]{0,90})",
-    re.I,
-)
-PATRON_RADICADO = re.compile(
-    r"radicad[oa]?[^\d]{0,15}([\d][\d\.\-\s]{8,35}\d)", re.I
-)
-
-
-def construir_url_masificados(pagina: int) -> str:
-    return (
-        f"{BASE_URL_MASIFICADOS}?max_per_page=50&order_search=date_desc"
-        f"&search_results_view=lineal&page={pagina}"
-    )
-
-
-def extraer_avisos_masificados(texto: str, url_pagina: str):
-    """
-    Extrae los avisos de una página de resultados a partir del texto ya
-    convertido con html_a_texto(). No se depende de la estructura interna
-    de las etiquetas HTML (que puede cambiar): cada aviso deja, dentro del
-    texto plano, el enlace de detalle escrito de forma literal (aparece
-    como su propio texto de ancla en la página), el fragmento truncado del
-    edicto (termina en "...") y la línea "Publicado: dd/mm/aaaa".
-    """
-    resultados = []
-    vistos = set()
-
-    for m in re.finditer(r"https://www\.masificados\.com/otros/ocasional/\d+/aviso/(\d+)/", texto):
-        aviso_id = m.group(1)
-        if aviso_id in vistos:
-            continue
-        vistos.add(aviso_id)
-
-        inicio = max(0, m.start() - 400)
-        fin = min(len(texto), m.end() + 400)
-        bloque = texto[inicio:fin]
-
-        titulo_m = re.search(r"([^\n]{20,400}\.\.\.)", bloque)
-        titulo = re.sub(r"\s+", " ", titulo_m.group(1)).strip() if titulo_m else "Ver aviso completo en el enlace"
-
-        fecha_m = re.search(r"Publicado:\**\s*(\d{1,2}/\d{1,2}/\d{4})", bloque)
-        fecha_texto = fecha_m.group(1) if fecha_m else None
-
-        resultados.append({
-            "id": aviso_id,
-            "titulo": titulo,
-            "fecha_texto": fecha_texto or "No especificada",
-            "fecha": parse_fecha(fecha_texto),
-            "enlace": m.group(0),
-            "fuente": url_pagina,
-        })
-    return resultados
-
-
-def extraer_detalle_aviso(url_detalle: str) -> dict:
-    """
-    Entra a la página individual del aviso y saca el texto completo del
-    edicto (no el fragmento truncado de la lista), más el despacho y el
-    radicado si se logran identificar dentro de ese texto.
-    """
+    dia, mes, anio = m.groups()
     try:
-        html = descargar(url_detalle)
-    except Exception as e:
-        print(f"[Masificados] Error al abrir detalle {url_detalle}: {e}")
-        return {"texto_completo": None, "juzgado": "No especificado", "radicado": "No especificado"}
+        return datetime.date(int(anio), int(mes), int(dia))
+    except ValueError:
+        return None
 
+
+def extraer_descripcion(html):
+    # La meta og:description trae el texto completo del edicto (más
+    # confiable que intentar parsear el bloque visible de la página).
+    m = OG_DESCRIPTION_RE.search(html)
+    if m:
+        desc = m.group(1)
+        desc = desc.replace("&amp;", "&").replace("&quot;", '"').replace("&#039;", "'")
+        return re.sub(r"\s+", " ", desc).strip()
+
+    # Respaldo: extraer el bloque "Descripción" del cuerpo visible.
     texto = html_a_texto(html)
-
-    m_inicio = re.search(r"(E\s*D\s*I\s*C\s*T\s*O|AVISO|JUZGADO|NOTAR[IÍ]A|TRIBUNAL|CARTEL)", texto, re.I)
-    cuerpo = texto[m_inicio.start():] if m_inicio else texto
-
-    # Se corta el cuerpo antes de secciones típicas de pie/relacionados,
-    # si aparecen, para no arrastrar ruido de navegación del sitio.
-    cuerpo = re.split(
-        r"\n\s*(Enviar a un amigo|Marcar como favorito|Avisos relacionados|Comentarios|Compartir)",
-        cuerpo, maxsplit=1, flags=re.I,
-    )[0]
-    cuerpo = re.sub(r"\s+", " ", cuerpo).strip()
-
-    despacho_m = PATRON_DESPACHO.search(cuerpo)
-    radicado_m = PATRON_RADICADO.search(cuerpo)
-
-    return {
-        "texto_completo": cuerpo[:1500] if cuerpo else None,
-        "juzgado": despacho_m.group(0).strip() if despacho_m else "No especificado",
-        "radicado": radicado_m.group(1).strip() if radicado_m else "No especificado",
-    }
+    m = re.search(r"Descripci[oó]n\s*\n+(.+?)(?:\n\s*Denunciar|\n\s*Avisos similares|$)", texto, re.S | re.I)
+    if m:
+        return re.sub(r"\s+", " ", m.group(1)).strip()
+    return "Descripción no disponible, revisa el aviso en el enlace."
 
 
-def recolectar_masificados():
-    hoy = datetime.date.today()
-    fecha_limite = hoy - datetime.timedelta(days=MASIFICADOS_DIAS_ATRAS)
+def recolectar_edictos():
+    ids = listar_ids_avisos()
+    print(f"[Edictos] {len(ids)} aviso(s) encontrados en el listado")
 
-    resultados = []
-    for pagina in range(1, MAX_PAGES_MASIFICADOS + 1):
-        url = construir_url_masificados(pagina)
+    avisos = []
+    for id_aviso in ids:
+        # El id de categoría exacto no es necesario para acceder al aviso;
+        # el sitio redirige correctamente aunque se use un valor genérico.
+        url_detalle = f"https://www.masificados.com/otros/ocasional/0/aviso/{id_aviso}/"
         try:
-            html = descargar(url)
+            html = descargar(url_detalle)
         except Exception as e:
-            print(f"[Masificados] Error en página {pagina}: {e}")
-            break
+            print(f"[Edictos] Error abriendo aviso {id_aviso}: {e}")
+            continue
 
-        texto = html_a_texto(html)
-        avisos_pagina = extraer_avisos_masificados(texto, url)
-        if not avisos_pagina:
-            break
+        descripcion = extraer_descripcion(html)
+        fecha = parse_fecha_publicado(html)
+        radicado_m = RADICADO_RE.search(descripcion)
 
-        # El listado viene ordenado del más nuevo al más antiguo
-        # (order_search=date_desc), así que en cuanto una página ya no
-        # trae nada dentro de la ventana de "reciente", dejamos de paginar.
-        recientes_pagina = [a for a in avisos_pagina if a["fecha"] and a["fecha"] >= fecha_limite]
-        resultados.extend(recientes_pagina)
+        avisos.append({
+            "id": id_aviso,
+            "descripcion": descripcion,
+            "fecha_publicado": fecha,
+            "fecha_publicado_texto": fecha.strftime("%d/%m/%Y") if fecha else "No especificada",
+            "radicado": radicado_m.group(1).strip() if radicado_m else None,
+            "link": url_detalle,
+        })
 
-        if not recientes_pagina:
-            break
-
-    vistos, unicos = set(), []
-    for a in resultados:
-        if a["id"] not in vistos:
-            vistos.add(a["id"])
-            unicos.append(a)
-    unicos.sort(key=lambda a: a["fecha"] or hoy, reverse=True)
-
-    # Se completa cada aviso reciente con el texto completo/despacho/radicado
-    # de su página de detalle, respetando el tope MASIFICADOS_MAX_DETALLES.
-    for a in unicos[:MASIFICADOS_MAX_DETALLES]:
-        detalle = extraer_detalle_aviso(a["enlace"])
-        a.update(detalle)
-    for a in unicos[MASIFICADOS_MAX_DETALLES:]:
-        a["texto_completo"] = None
-        a["juzgado"] = "No especificado"
-        a["radicado"] = "No especificado"
-
-    return unicos
+    avisos.sort(key=lambda a: (a["fecha_publicado"] is None, a["fecha_publicado"]), reverse=True)
+    return avisos
 
 
 # =========================================================================
 # CORREO
 # =========================================================================
 
-def construir_html(remates_banagrario, avisos_masificados):
+def construir_html(edictos):
     hoy = datetime.date.today().isoformat()
 
-    if remates_banagrario:
-        filas_ba = ""
-        for r in remates_banagrario:
-            descuento = calcular_descuento(r.get("avaluo"), r.get("postura"))
-            descuento_txt = f"{descuento}% del avalúo" if descuento else "No calculable"
-            filas_ba += f"""
+    if edictos:
+        filas = ""
+        for e in edictos:
+            radicado_html = f"<p style='margin:2px 0;'><b>Radicado:</b> {e['radicado']}</p>" if e.get("radicado") else ""
+            filas += f"""
             <div style="border:1px solid #ddd;border-radius:8px;padding:14px;margin-bottom:14px;">
-              <p style="margin:2px 0;"><b>Bien:</b> {r.get('bien')}</p>
-              <p style="margin:2px 0;"><b>Avalúo:</b> ${r.get('avaluo') or '-'} &nbsp; | &nbsp; <b>Postura mínima:</b> ${r.get('postura') or '-'} &nbsp; | &nbsp; <b>Postura frente al avalúo:</b> {descuento_txt}</p>
-              <p style="margin:2px 0;"><b>Fecha del remate:</b> {r.get('fecha_remate_texto')} &nbsp; | &nbsp; <b>Juzgado:</b> {r.get('juzgado')}</p>
-              <p style="margin:2px 0;"><b>Radicación:</b> {r.get('radicacion')}</p>
-              <p style="margin:6px 0;"><a href="{r.get('link')}">Ver en el portal del Banco Agrario</a></p>
+              <p style="margin:2px 0;"><b>Publicado:</b> {e.get('fecha_publicado_texto')}</p>
+              {radicado_html}
+              <p style="margin:6px 0;">{e.get('descripcion')}</p>
+              <p style="margin:6px 0;"><a href="{e.get('link')}">Ver aviso completo en Masificados / El Colombiano</a></p>
             </div>
             """
-        seccion_ba = f"<h3>Banco Agrario ({len(remates_banagrario)} remate(s) vigente(s))</h3>{filas_ba}"
+        seccion = f"<h3>Edictos judiciales - Clasificados El Colombiano ({len(edictos)} aviso(s))</h3>{filas}"
     else:
-        seccion_ba = "<h3>Banco Agrario</h3><p>No se encontraron remates vigentes en esta revisión.</p>"
-
-    if avisos_masificados:
-        filas_ma = ""
-        for a in avisos_masificados:
-            texto_mostrar = a.get("texto_completo") or a.get("titulo")
-            filas_ma += f"""
-            <div style="border:1px solid #ddd;border-radius:8px;padding:14px;margin-bottom:14px;">
-              <p style="margin:2px 0;"><b>Despacho:</b> {a.get('juzgado', 'No especificado')}</p>
-              <p style="margin:2px 0;"><b>Radicado:</b> {a.get('radicado', 'No especificado')}</p>
-              <p style="margin:2px 0;"><b>Publicado:</b> {a.get('fecha_texto')}</p>
-              <p style="margin:2px 0;"><b>Texto del aviso:</b> {texto_mostrar}</p>
-              <p style="margin:6px 0;"><a href="{a.get('enlace')}">Ver aviso completo</a></p>
-            </div>
-            """
-        seccion_ma = (
-            f"<h3>Avisos Masificados (El Colombiano) — Judiciales/Edictos recientes ({len(avisos_masificados)} aviso(s))</h3>"
-            f"{filas_ma}"
-        )
-    else:
-        seccion_ma = "<h3>Avisos Masificados (El Colombiano) — Judiciales/Edictos</h3><p>No se encontraron avisos recientes en esta revisión.</p>"
+        seccion = "<h3>Edictos judiciales - Clasificados El Colombiano</h3><p>No se encontraron edictos en esta revisión.</p>"
 
     return f"""
     <html>
       <body style="font-family:Arial, sans-serif; color:#222;">
-        <h2>Remates judiciales en Colombia — {hoy}</h2>
-        {seccion_ba}
-        <hr>
-        {seccion_ma}
+        <h2>Edictos judiciales más recientes — {hoy}</h2>
+        {seccion}
         <hr>
         <p style="font-size:12px;color:#888;">
-          Verifica siempre la información directamente en el portal/juzgado
-          correspondiente antes de tomar cualquier decisión de inversión.
+          Verifica siempre la información directamente en el aviso original
+          antes de tomar cualquier decisión legal o financiera.
           Este resumen no constituye asesoría legal ni financiera.
         </p>
       </body>
@@ -404,7 +199,7 @@ def enviar_correo(html: str, total: int):
         print("Faltan variables de correo (GMAIL_USER / GMAIL_APP_PASSWORD / RECIPIENT_EMAIL). No se envía correo.")
         return
 
-    asunto = f"Remates judiciales Colombia — {total} resultado(s) — {datetime.date.today().isoformat()}"
+    asunto = f"Edictos judiciales El Colombiano — {total} resultado(s) — {datetime.date.today().isoformat()}"
     msg = MIMEMultipart("alternative")
     msg["Subject"] = asunto
     msg["From"] = GMAIL_USER
@@ -419,14 +214,11 @@ def enviar_correo(html: str, total: int):
 
 
 def main():
-    remates_banagrario = recolectar_banagrario()
-    print(f"Banco Agrario: {len(remates_banagrario)} remate(s) vigente(s)")
+    edictos = recolectar_edictos()
+    print(f"Edictos: {len(edictos)} aviso(s) recolectados")
 
-    avisos_masificados = recolectar_masificados()
-    print(f"Masificados: {len(avisos_masificados)} aviso(s) reciente(s) encontrado(s)")
-
-    html = construir_html(remates_banagrario, avisos_masificados)
-    enviar_correo(html, len(remates_banagrario) + len(avisos_masificados))
+    html = construir_html(edictos)
+    enviar_correo(html, len(edictos))
 
 
 if __name__ == "__main__":
