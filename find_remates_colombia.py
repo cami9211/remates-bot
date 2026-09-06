@@ -6,19 +6,36 @@ Combina dos fuentes, ambas leídas directamente sin ninguna API de IA:
   1. Banco Agrario de Colombia (bancoagrario.gov.co/remates-judiciales)
      -> Datos estructurados: avalúo, postura, fecha, juzgado, bien.
 
-  2. Rama Judicial (ramajudicial.gov.co) - juzgados civiles configurados
-     abajo en JUZGADOS_A_REVISAR (por defecto: Medellín)
-     -> Menos estructurado: cada juzgado publica el radicado, una
-     descripción libre y un enlace al PDF/aviso oficial. Debes abrir el
-     PDF para ver avalúo/postura/bien, ya que el sitio no los expone en
-     texto plano. Esta parte es más experimental que la del Banco
-     Agrario porque depende de la estructura HTML de cada micrositio.
+  2. Publicaciones Procesales - Rama Judicial
+     (publicacionesprocesales.ramajudicial.gov.co)
+     -> Portal nuevo (reemplaza los micrositios individuales de cada
+     juzgado) que permite filtrar por Departamento, Municipio, Entidad,
+     Especialidad, Despacho y rango de fechas. Aquí se usa preconfigurado
+     para traer publicaciones de tipo "Remates" (idStructure=6098997) en
+     Antioquia / Medellín.
+
+     ADVERTENCIA / LIMITACIÓN CONOCIDA: este portal es un portlet Liferay
+     que carga resultados de forma dinámica y cuyo filtro de Municipio
+     parece depender del estado de sesión (no viaja en la URL). Además,
+     su robots.txt bloquea el acceso automatizado de algunas herramientas,
+     así que antes de dejar esto corriendo de forma recurrente, confirma
+     que el uso que le vas a dar respeta los términos de uso del portal.
+     La extracción de campos (radicado, fecha, despacho, enlace) usa
+     heurísticas genéricas porque no fue posible inspeccionar el HTML/JSON
+     real que devuelve el portal al aplicar el filtro. Si al correr el
+     script ves que no trae nada o trae basura, activa DEBUG_DUMP_PP=1,
+     revisa los archivos HTML que se guardan y ajusta la función
+     `extraer_publicaciones()` (o compárteme un fragmento del HTML real y
+     te dejo el parser calibrado).
 
 Variables de entorno requeridas (Secrets en GitHub):
   GMAIL_USER, GMAIL_APP_PASSWORD, RECIPIENT_EMAIL
 
 Opcional:
-  MAX_PAGES_BANCO_AGRARIO -> páginas del Banco Agrario a revisar (default 5)
+  MAX_PAGES_BANCO_AGRARIO   -> páginas del Banco Agrario a revisar (default 5)
+  MAX_PAGES_PUBLICACIONES   -> páginas de Publicaciones Procesales (default 5)
+  DEBUG_DUMP_PP=1           -> guarda el HTML crudo de cada página de
+                               Publicaciones Procesales para calibrar el parser
 """
 
 import os
@@ -28,6 +45,8 @@ import smtplib
 import datetime
 import urllib.request
 import urllib.error
+import urllib.parse
+import http.cookiejar
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
@@ -35,6 +54,8 @@ GMAIL_USER = os.environ.get("GMAIL_USER")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
 RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", GMAIL_USER)
 MAX_PAGES_BANCO_AGRARIO = int(os.environ.get("MAX_PAGES_BANCO_AGRARIO", "5"))
+MAX_PAGES_PUBLICACIONES = int(os.environ.get("MAX_PAGES_PUBLICACIONES", "5"))
+DEBUG_DUMP_PP = os.environ.get("DEBUG_DUMP_PP", "0") == "1"
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (remates-bot; uso personal)"}
 
@@ -173,84 +194,151 @@ def recolectar_banagrario():
 
 
 # =========================================================================
-# FUENTE 2: RAMA JUDICIAL (juzgados configurados)
+# FUENTE 2: PUBLICACIONES PROCESALES - RAMA JUDICIAL (portal nuevo)
 # =========================================================================
 
-RAMA_JUDICIAL_BASE = "https://www.ramajudicial.gov.co"
+# Cookiejar/opener propio para esta fuente: el portlet de Liferay suele
+# necesitar conservar la sesión (JSESSIONID) entre la carga de la página y
+# la llamada de filtro, así que reutilizamos el mismo "opener" en todas las
+# páginas en vez de usar urllib.request.urlopen directo.
+_pp_cookie_jar = http.cookiejar.CookieJar()
+_pp_opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(_pp_cookie_jar))
 
-# Agrega aquí más juzgados si quieres cubrir otras ciudades.
-# El "slug" es la parte de la URL después de /web/ en el micrositio del juzgado.
-JUZGADOS_A_REVISAR = [
-    ("Juzgado 001 Civil del Circuito de Medellín", "juzgado-001-civil-del-circuito-de-medellin"),
-    ("Juzgado 02 de Ejecución Civil del Circuito de Medellín", "juzgado-02-de-ejecucion-civil-del-circuito-de-medellin"),
-    ("Juzgado 03 de Ejecución Civil del Circuito de Medellín", "juzgado-03-de-ejecucion-civil-del-circuito-de-medellin"),
-]
+PP_BASE_URL = "https://publicacionesprocesales.ramajudicial.gov.co/web/publicaciones-procesales/inicio"
+PP_PORTLET_ID = "co_com_avanti_efectosProcesales_PublicacionesEfectosProcesalesPortletV2_INSTANCE_BIyXQFHVaYaq"
+PP_NS = f"_{PP_PORTLET_ID}_"
+
+# "Remates" según el idStructure que trae el link que compartiste.
+PP_ID_STRUCTURE_REMATES = "6098997"
+
+# No tenemos confirmado el código numérico interno de Antioquia/Medellín en
+# los combos del portal (no pude inspeccionar el sitio). Por ahora se deja
+# el departamento en blanco (equivalente a "Todos", igual que en tu link:
+# idDepto=" ") y el filtro real de ciudad se hace en Python sobre el texto
+# de cada resultado (ver `es_de_interes`). Si consigues el código exacto de
+# Antioquia/Medellín (por ejemplo mirando el <select> del filtro en el
+# navegador), ponlo aquí para que el portal ya venga pre-filtrado.
+PP_ID_DEPTO = " "
+PP_ID_MUNICIPIO = None  # ej: "05001" si llegas a confirmar el código de Medellín
+
+PP_DEPARTAMENTO_OBJETIVO = "ANTIOQUIA"
+PP_MUNICIPIO_OBJETIVO = "MEDELLÍN"
 
 
-def encontrar_url_remates_reciente(html: str):
-    m = re.search(r'>Remates<.*?(?=>Sentencias<|>Traslados)', html, re.S | re.I)
-    if not m:
-        return None, None
-    bloque = m.group(0)
-    pares = re.findall(r'href="([^"]+)"[^>]*>\s*(\d{4})\s*<', bloque)
-    if not pares:
-        return None, None
-    pares_ordenados = sorted(pares, key=lambda p: int(p[1]), reverse=True)
-    url_relativa, anio = pares_ordenados[0]
-    url_final = url_relativa if url_relativa.startswith("http") else RAMA_JUDICIAL_BASE + url_relativa
-    return url_final, anio
+def construir_url_publicaciones(pagina: int) -> str:
+    params = {
+        "p_p_id": PP_PORTLET_ID,
+        "p_p_lifecycle": "0",
+        "p_p_state": "normal",
+        "p_p_mode": "view",
+        PP_NS + "idStructure": PP_ID_STRUCTURE_REMATES,
+        PP_NS + "action": "filterStructures",
+        PP_NS + "idDepto": PP_ID_DEPTO,
+        PP_NS + "verTotales": "true",
+        PP_NS + "cur": str(pagina),
+    }
+    if PP_ID_MUNICIPIO:
+        params[PP_NS + "idMunicipio"] = PP_ID_MUNICIPIO
+    return PP_BASE_URL + "?" + urllib.parse.urlencode(params)
 
 
-def extraer_avisos_remate(html: str, url_pagina: str):
-    enlaces = re.findall(r'href="([^"]+)">\s*(\d{15,25})\s*<', html)
-    texto = html_a_texto(html)
-    avisos = []
-    for enlace, radicado in enlaces:
-        idx = texto.find(radicado)
-        contexto = texto[idx:idx + 400] if idx != -1 else ""
-        contexto = re.sub(r"\s+", " ", contexto).strip()
-        avisos.append({
+def descargar_publicaciones(url: str, referer: str = None) -> str:
+    headers = dict(HEADERS)
+    if referer:
+        headers["Referer"] = referer
+    req = urllib.request.Request(url, headers=headers)
+    with _pp_opener.open(req, timeout=60) as resp:
+        return resp.read().decode("utf-8", errors="ignore")
+
+
+def es_de_interes(texto: str) -> bool:
+    """Filtro de seguridad por si el filtro de Municipio no quedó aplicado
+    del lado del servidor (ver nota en la cabecera del archivo)."""
+    texto_up = texto.upper()
+    return PP_MUNICIPIO_OBJETIVO in texto_up or PP_DEPARTAMENTO_OBJETIVO in texto_up
+
+
+def extraer_publicaciones(texto: str, html: str, url_pagina: str):
+    """
+    Heurística genérica para extraer registros de la página de resultados.
+
+    Se apoya en que el número de radicado judicial colombiano (formato
+    unificado) tiene 20-23 dígitos y es prácticamente único por proceso,
+    sin importar el rediseño del portal. Alrededor de cada radicado se
+    busca una fecha (dd/mm/aaaa) y el nombre del despacho.
+
+    ESTO ES UN PUNTO DE PARTIDA, no una extracción confirmada contra el
+    HTML real (ver advertencia al inicio del archivo). Actívalo con
+    DEBUG_DUMP_PP=1 y ajústalo si hace falta.
+    """
+    resultados = []
+    vistos = set()
+
+    for m in re.finditer(r"\b(\d{20,23})\b", texto):
+        radicado = m.group(1)
+        if radicado in vistos:
+            continue
+        vistos.add(radicado)
+
+        inicio = max(0, m.start() - 300)
+        fin = min(len(texto), m.end() + 300)
+        contexto = re.sub(r"\s+", " ", texto[inicio:fin]).strip()
+
+        fecha_m = re.search(r"\b\d{1,2}/\d{1,2}/\d{4}\b", contexto)
+        despacho_m = re.search(r"(JUZGADO[^.\n]{0,80}|TRIBUNAL[^.\n]{0,80})", contexto, re.I)
+
+        resultados.append({
             "radicado": radicado,
-            "detalle": contexto[:300] or "Sin descripción disponible, revisa el documento.",
-            "documento": enlace,
+            "fecha_texto": fecha_m.group(0) if fecha_m else "No especificada",
+            "despacho": despacho_m.group(0).strip() if despacho_m else "No especificado",
+            "detalle": contexto[:300],
+            "documento": None,
             "fuente": url_pagina,
         })
-    return avisos
+
+    # Enlaces a PDF encontrados en la página (no se pueden asociar con
+    # certeza a un radicado específico sin ver el HTML real, así que se
+    # exponen aparte para revisión manual si hacen falta).
+    enlaces_pdf = re.findall(r'href="([^"]+\.pdf[^"]*)"', html, re.I)
+    if enlaces_pdf and resultados:
+        for i, r in enumerate(resultados):
+            if i < len(enlaces_pdf):
+                r["documento"] = enlaces_pdf[i]
+
+    return resultados
 
 
-def recolectar_rama_judicial():
+def recolectar_publicaciones_procesales():
     resultados = []
-    for nombre, slug in JUZGADOS_A_REVISAR:
-        base_url = f"{RAMA_JUDICIAL_BASE}/web/{slug}"
+    referer = PP_BASE_URL
+    for pagina in range(1, MAX_PAGES_PUBLICACIONES + 1):
+        url = construir_url_publicaciones(pagina)
         try:
-            html_base = descargar(base_url)
+            html = descargar_publicaciones(url, referer=referer)
         except Exception as e:
-            print(f"[Rama Judicial] No se pudo abrir {nombre}: {e}")
-            continue
+            print(f"[Publicaciones Procesales] Error en página {pagina}: {e}")
+            break
+        referer = url
 
-        url_remates, anio = encontrar_url_remates_reciente(html_base)
-        if not url_remates:
-            print(f"[Rama Judicial] No se encontró sección de Remates para {nombre}")
-            continue
+        if DEBUG_DUMP_PP:
+            nombre_archivo = f"debug_publicaciones_pagina_{pagina}.html"
+            with open(nombre_archivo, "w", encoding="utf-8") as f:
+                f.write(html)
+            print(f"[Publicaciones Procesales] HTML crudo guardado en {nombre_archivo}")
 
-        try:
-            html_remates = descargar(url_remates)
-        except Exception as e:
-            print(f"[Rama Judicial] Error descargando remates de {nombre}: {e}")
-            continue
+        texto = html_a_texto(html)
+        registros = extraer_publicaciones(texto, html, url)
+        registros = [r for r in registros if es_de_interes(r["detalle"])]
 
-        avisos = extraer_avisos_remate(html_remates, url_remates)
-        for a in avisos:
-            a["juzgado"] = nombre
-            a["anio"] = anio
-        resultados.extend(avisos)
+        if not registros:
+            break
+        resultados.extend(registros)
 
-    # deduplicar por radicado
     vistos, unicos = set(), []
-    for a in resultados:
-        if a["radicado"] not in vistos:
-            vistos.add(a["radicado"])
-            unicos.append(a)
+    for r in resultados:
+        if r["radicado"] not in vistos:
+            vistos.add(r["radicado"])
+            unicos.append(r)
     return unicos
 
 
@@ -258,7 +346,7 @@ def recolectar_rama_judicial():
 # CORREO
 # =========================================================================
 
-def construir_html(remates_banagrario, avisos_rama):
+def construir_html(remates_banagrario, avisos_publicaciones):
     hoy = datetime.date.today().isoformat()
 
     if remates_banagrario:
@@ -279,20 +367,29 @@ def construir_html(remates_banagrario, avisos_rama):
     else:
         seccion_ba = "<h3>Banco Agrario</h3><p>No se encontraron remates vigentes en esta revisión.</p>"
 
-    if avisos_rama:
-        filas_rj = ""
-        for a in avisos_rama:
-            filas_rj += f"""
+    if avisos_publicaciones:
+        filas_pp = ""
+        for a in avisos_publicaciones:
+            enlace_doc = (
+                f'<a href="{a.get("documento")}">Ver documento/aviso oficial (PDF)</a> &nbsp;|&nbsp; '
+                if a.get("documento") else ""
+            )
+            filas_pp += f"""
             <div style="border:1px solid #ddd;border-radius:8px;padding:14px;margin-bottom:14px;">
-              <p style="margin:2px 0;"><b>Juzgado:</b> {a.get('juzgado')} ({a.get('anio')})</p>
+              <p style="margin:2px 0;"><b>Despacho:</b> {a.get('despacho')}</p>
               <p style="margin:2px 0;"><b>Radicado:</b> {a.get('radicado')}</p>
+              <p style="margin:2px 0;"><b>Fecha:</b> {a.get('fecha_texto')}</p>
               <p style="margin:2px 0;"><b>Detalle:</b> {a.get('detalle')}</p>
-              <p style="margin:6px 0;"><a href="{a.get('documento')}">Ver documento/aviso oficial (PDF)</a> &nbsp;|&nbsp; <a href="{a.get('fuente')}">Ver página del juzgado</a></p>
+              <p style="margin:6px 0;">{enlace_doc}<a href="{a.get('fuente')}">Ver página de resultados</a></p>
             </div>
             """
-        seccion_rj = f"<h3>Rama Judicial — juzgados de Medellín ({len(avisos_rama)} aviso(s))</h3><p style='font-size:12px;color:#888;'>Esta fuente no expone avalúo ni postura en texto plano: ábrelo el PDF del aviso para ver los detalles completos del remate.</p>{filas_rj}"
+        seccion_pp = (
+            f"<h3>Publicaciones Procesales — Remates en Medellín, Antioquia ({len(avisos_publicaciones)} registro(s))</h3>"
+            f"<p style='font-size:12px;color:#888;'>Esta extracción es heurística; verifica cada registro en el enlace de la página de resultados.</p>"
+            f"{filas_pp}"
+        )
     else:
-        seccion_rj = "<h3>Rama Judicial — juzgados de Medellín</h3><p>No se encontraron avisos de remate en esta revisión.</p>"
+        seccion_pp = "<h3>Publicaciones Procesales — Remates en Medellín, Antioquia</h3><p>No se encontraron avisos de remate en esta revisión.</p>"
 
     return f"""
     <html>
@@ -300,7 +397,7 @@ def construir_html(remates_banagrario, avisos_rama):
         <h2>Remates judiciales en Colombia — {hoy}</h2>
         {seccion_ba}
         <hr>
-        {seccion_rj}
+        {seccion_pp}
         <hr>
         <p style="font-size:12px;color:#888;">
           Verifica siempre la información directamente en el portal/juzgado
@@ -335,11 +432,11 @@ def main():
     remates_banagrario = recolectar_banagrario()
     print(f"Banco Agrario: {len(remates_banagrario)} remate(s) vigente(s)")
 
-    avisos_rama = recolectar_rama_judicial()
-    print(f"Rama Judicial: {len(avisos_rama)} aviso(s) encontrado(s)")
+    avisos_publicaciones = recolectar_publicaciones_procesales()
+    print(f"Publicaciones Procesales: {len(avisos_publicaciones)} registro(s) encontrado(s)")
 
-    html = construir_html(remates_banagrario, avisos_rama)
-    enviar_correo(html, len(remates_banagrario) + len(avisos_rama))
+    html = construir_html(remates_banagrario, avisos_publicaciones)
+    enviar_correo(html, len(remates_banagrario) + len(avisos_publicaciones))
 
 
 if __name__ == "__main__":
