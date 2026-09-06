@@ -1,22 +1,19 @@
 """
-Bot de oportunidades de remates judiciales en Colombia
---------------------------------------------------------
-Este script:
-  1. Le pide a Claude (con la herramienta de búsqueda web) que investigue
-     oportunidades vigentes de remates/subastas judiciales en Colombia
-     (inmuebles, vehículos, empresas, etc.) que puedan ser interesantes
-     como inversión.
-  2. Recibe el resultado en formato estructurado (JSON).
-  3. Arma un correo en HTML con el resumen y lo envía por Gmail.
+Bot de oportunidades de remates judiciales en Colombia (versión GRATIS con Gemini)
+------------------------------------------------------------------------------------
+Igual que find_remates_colombia.py pero usa la API gratuita de Google Gemini
+en lugar de la API de pago de Anthropic. No requiere tarjeta de crédito:
+la API key de Google AI Studio incluye una cuota diaria gratuita de sobra
+para correr este bot varias veces al día.
 
 Variables de entorno requeridas (se configuran como "Secrets" en GitHub):
-  ANTHROPIC_API_KEY   -> API key de https://console.anthropic.com
+  GEMINI_API_KEY      -> API key gratuita de https://aistudio.google.com/apikey
   GMAIL_USER          -> correo de Gmail que envía el mensaje
   GMAIL_APP_PASSWORD  -> "contraseña de aplicación" de Gmail (16 caracteres)
   RECIPIENT_EMAIL     -> correo que RECIBE el resumen (puede ser el mismo GMAIL_USER)
 
 Opcional:
-  MODEL               -> modelo de Anthropic a usar (default: claude-sonnet-4-6)
+  GEMINI_MODEL        -> modelo a usar (default: gemini-2.5-flash)
 """
 
 import os
@@ -30,16 +27,14 @@ from email.mime.text import MIMEText
 import urllib.request
 import urllib.error
 
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 GMAIL_USER = os.environ.get("GMAIL_USER")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
 RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", GMAIL_USER)
-MODEL = os.environ.get("MODEL", "claude-sonnet-4-6")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
-ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
-# Fuentes típicas de remates judiciales / activos en Colombia que el modelo
-# debe priorizar al buscar. Se le pasan como contexto en el prompt.
 FUENTES_SUGERIDAS = [
     "Rama Judicial de Colombia - consulta de procesos y edictos de remate",
     "SAE (Sociedad de Activos Especiales) - subastas de activos",
@@ -59,10 +54,9 @@ Hoy es {hoy}. Eres un analista que investiga oportunidades DE INVERSIÓN en
 remates y subastas judiciales vigentes en Colombia (inmuebles, vehículos,
 lotes, locales comerciales, empresas o activos en general).
 
-Usa la herramienta de búsqueda web para encontrar remates o subastas
-ACTUALMENTE ABIERTOS o próximos a realizarse (no remates ya cerrados hace
-meses). Prioriza estas fuentes, pero puedes buscar en otras si son
-confiables:
+Usa la búsqueda web para encontrar remates o subastas ACTUALMENTE ABIERTOS
+o próximos a realizarse (no remates ya cerrados hace meses). Prioriza estas
+fuentes, pero puedes buscar en otras si son confiables:
 {fuentes}
 
 Para cada oportunidad que encuentres y que parezca razonablemente atractiva
@@ -97,33 +91,30 @@ inventes datos ni links falsos.
 """
 
 
-def llamar_claude(prompt: str) -> dict:
+def llamar_gemini(prompt: str) -> dict:
     body = {
-        "model": MODEL,
-        "max_tokens": 4000,
-        "tools": [{"type": "web_search_20250305", "name": "web_search"}],
-        "messages": [{"role": "user", "content": prompt}],
+        "contents": [{"parts": [{"text": prompt}]}],
+        "tools": [{"google_search": {}}],
     }
     req = urllib.request.Request(
-        ANTHROPIC_URL,
+        f"{GEMINI_URL}?key={GEMINI_API_KEY}",
         data=json.dumps(body).encode("utf-8"),
-        headers={
-            "content-type": "application/json",
-            "x-api-key": ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-        },
+        headers={"content-type": "application/json"},
         method="POST",
     )
     try:
         with urllib.request.urlopen(req, timeout=180) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        print("Error llamando a la API de Anthropic:", e.read().decode("utf-8"))
+        print("Error llamando a la API de Gemini:", e.read().decode("utf-8"))
         raise
 
-    texto = "".join(
-        block.get("text", "") for block in data.get("content", []) if block.get("type") == "text"
-    )
+    try:
+        texto = data["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError):
+        print("Respuesta inesperada de Gemini:", json.dumps(data)[:2000])
+        return {"fecha_busqueda": datetime.date.today().isoformat(), "oportunidades": [], "resumen_general": "Error al leer la respuesta del modelo."}
+
     texto_limpio = texto.strip()
     if texto_limpio.startswith("```"):
         texto_limpio = texto_limpio.strip("`")
@@ -199,12 +190,12 @@ def enviar_correo(html: str, num_oportunidades: int):
 
 
 def main():
-    if not ANTHROPIC_API_KEY:
-        print("Falta ANTHROPIC_API_KEY.")
+    if not GEMINI_API_KEY:
+        print("Falta GEMINI_API_KEY.")
         sys.exit(1)
 
     prompt = construir_prompt()
-    resultado = llamar_claude(prompt)
+    resultado = llamar_gemini(prompt)
     num = len(resultado.get("oportunidades", []))
     print(f"Oportunidades encontradas: {num}")
 
