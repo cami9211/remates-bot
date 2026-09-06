@@ -6,36 +6,20 @@ Combina dos fuentes, ambas leídas directamente sin ninguna API de IA:
   1. Banco Agrario de Colombia (bancoagrario.gov.co/remates-judiciales)
      -> Datos estructurados: avalúo, postura, fecha, juzgado, bien.
 
-  2. Publicaciones Procesales - Rama Judicial
-     (publicacionesprocesales.ramajudicial.gov.co)
-     -> Portal nuevo (reemplaza los micrositios individuales de cada
-     juzgado) que permite filtrar por Departamento, Municipio, Entidad,
-     Especialidad, Despacho y rango de fechas. Aquí se usa preconfigurado
-     para traer publicaciones de tipo "Remates" (idStructure=6098997) en
-     Antioquia / Medellín.
-
-     ADVERTENCIA / LIMITACIÓN CONOCIDA: este portal es un portlet Liferay
-     que carga resultados de forma dinámica y cuyo filtro de Municipio
-     parece depender del estado de sesión (no viaja en la URL). Además,
-     su robots.txt bloquea el acceso automatizado de algunas herramientas,
-     así que antes de dejar esto corriendo de forma recurrente, confirma
-     que el uso que le vas a dar respeta los términos de uso del portal.
-     La extracción de campos (radicado, fecha, despacho, enlace) usa
-     heurísticas genéricas porque no fue posible inspeccionar el HTML/JSON
-     real que devuelve el portal al aplicar el filtro. Si al correr el
-     script ves que no trae nada o trae basura, activa DEBUG_DUMP_PP=1,
-     revisa los archivos HTML que se guardan y ajusta la función
-     `extraer_publicaciones()` (o compárteme un fragmento del HTML real y
-     te dejo el parser calibrado).
+  2. Avisos Masificados de El Colombiano - Judiciales / Edictos
+     (masificados.com/otros/avisos/judiciales/edictos)
+     -> Listado de edictos, emplazamientos, avisos de remate, avisos de
+     liquidación patrimonial, etc. publicados por juzgados y notarías,
+     mayoritariamente de Antioquia. Solo se conservan los avisos
+     recientes (por defecto, publicados desde el día anterior).
 
 Variables de entorno requeridas (Secrets en GitHub):
   GMAIL_USER, GMAIL_APP_PASSWORD, RECIPIENT_EMAIL
 
 Opcional:
   MAX_PAGES_BANCO_AGRARIO   -> páginas del Banco Agrario a revisar (default 5)
-  MAX_PAGES_PUBLICACIONES   -> páginas de Publicaciones Procesales (default 5)
-  DEBUG_DUMP_PP=1           -> guarda el HTML crudo de cada página de
-                               Publicaciones Procesales para calibrar el parser
+  MAX_PAGES_MASIFICADOS     -> páginas de Masificados a revisar (default 5)
+  MASIFICADOS_DIAS_ATRAS    -> qué tan "reciente" es reciente, en días (default 1)
 """
 
 import os
@@ -45,8 +29,6 @@ import smtplib
 import datetime
 import urllib.request
 import urllib.error
-import urllib.parse
-import http.cookiejar
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
@@ -54,8 +36,8 @@ GMAIL_USER = os.environ.get("GMAIL_USER")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
 RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", GMAIL_USER)
 MAX_PAGES_BANCO_AGRARIO = int(os.environ.get("MAX_PAGES_BANCO_AGRARIO", "5"))
-MAX_PAGES_PUBLICACIONES = int(os.environ.get("MAX_PAGES_PUBLICACIONES", "5"))
-DEBUG_DUMP_PP = os.environ.get("DEBUG_DUMP_PP", "0") == "1"
+MAX_PAGES_MASIFICADOS = int(os.environ.get("MAX_PAGES_MASIFICADOS", "5"))
+MASIFICADOS_DIAS_ATRAS = int(os.environ.get("MASIFICADOS_DIAS_ATRAS", "1"))
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (remates-bot; uso personal)"}
 
@@ -77,6 +59,20 @@ def html_a_texto(html: str) -> str:
     return texto
 
 
+def parse_fecha(s):
+    if not s:
+        return None
+    s = s.strip()
+    m = re.search(r"(\d{1,2})[/-](\d{1,2})[/-](\d{4})", s)
+    if m:
+        dia, mes, anio = m.groups()
+        try:
+            return datetime.date(int(anio), int(mes), int(dia))
+        except ValueError:
+            return None
+    return None
+
+
 # =========================================================================
 # FUENTE 1: BANCO AGRARIO
 # =========================================================================
@@ -92,7 +88,7 @@ MESES = {
 LISTING_SPLIT = re.compile(r"PERMITE INFORMAR A QUIEN INTERESE", re.I)
 
 
-def parse_fecha(s):
+def parse_fecha_larga(s):
     if not s:
         return None
     s = s.strip().lower()
@@ -105,14 +101,7 @@ def parse_fecha(s):
                 return datetime.date(int(anio), mes, int(dia))
             except ValueError:
                 return None
-    m = re.search(r"(\d{1,2})[/-](\d{1,2})[/-](\d{4})", s)
-    if m:
-        dia, mes, anio = m.groups()
-        try:
-            return datetime.date(int(anio), int(mes), int(dia))
-        except ValueError:
-            return None
-    return None
+    return parse_fecha(s)
 
 
 def campo(label: str, texto: str):
@@ -144,7 +133,7 @@ def extraer_listados_banagrario(texto: str, page_num: int):
             "avaluo": avaluo_m.group(1).strip() if avaluo_m else None,
             "postura": postura_m.group(1).strip() if postura_m else None,
             "fecha_remate_texto": fecha_txt or "No especificada",
-            "fecha_remate": parse_fecha(fecha_txt),
+            "fecha_remate": parse_fecha_larga(fecha_txt),
             "juzgado": juzgado or "No especificado",
             "radicacion": radicacion or "No especificada",
             "bien": bien or "Descripción no disponible",
@@ -194,167 +183,89 @@ def recolectar_banagrario():
 
 
 # =========================================================================
-# FUENTE 2: PUBLICACIONES PROCESALES - RAMA JUDICIAL (portal nuevo)
+# FUENTE 2: AVISOS MASIFICADOS (El Colombiano) - Judiciales / Edictos
 # =========================================================================
 
-# Cookiejar/opener propio para esta fuente: el portlet de Liferay suele
-# necesitar conservar la sesión (JSESSIONID) entre la carga de la página y
-# la llamada de filtro, así que reutilizamos el mismo "opener" en todas las
-# páginas en vez de usar urllib.request.urlopen directo.
-_pp_cookie_jar = http.cookiejar.CookieJar()
-_pp_opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(_pp_cookie_jar))
-
-PP_BASE_URL = "https://publicacionesprocesales.ramajudicial.gov.co/web/publicaciones-procesales/inicio"
-PP_PORTLET_ID = "co_com_avanti_efectosProcesales_PublicacionesEfectosProcesalesPortletV2_INSTANCE_BIyXQFHVaYaq"
-PP_NS = f"_{PP_PORTLET_ID}_"
-
-# "Remates" según el idStructure que trae el link que compartiste.
-PP_ID_STRUCTURE_REMATES = "6098997"
-
-# No tenemos confirmado el código numérico interno de Antioquia/Medellín en
-# los combos del portal (no pude inspeccionar el sitio). Por ahora se deja
-# el departamento en blanco (equivalente a "Todos", igual que en tu link:
-# idDepto=" ") y el filtro real de ciudad se hace en Python sobre el texto
-# de cada resultado (ver `es_de_interes`). Si consigues el código exacto de
-# Antioquia/Medellín (por ejemplo mirando el <select> del filtro en el
-# navegador, o la URL real que arma el botón "Buscar"), ponlo aquí para que
-# el portal ya venga pre-filtrado.
-PP_ID_DEPTO = " "
-PP_ID_MUNICIPIO = None  # ej: "05001" si confirmas el código de Medellín
-
-# --- Rango de fechas (Fecha Inicio / Fecha Fin del filtro) ---
-# HIPÓTESIS SIN CONFIRMAR: nombres de parámetro "fechaInicio"/"fechaFin"
-# siguiendo el mismo patrón camelCase de "idDepto"/"idStructure", en
-# formato dd/mm/aaaa (igual a como se ve en el formulario). Falta
-# verificar contra la URL/petición real que dispara el botón "Buscar".
-# Por defecto se arma una ventana móvil de PP_DIAS_ATRAS días hasta hoy,
-# igual de espíritu a la ventana que trae el formulario por defecto
-# (en la captura: 05/02/2026 a 04/09/2026, ~7 meses).
-PP_DIAS_ATRAS = int(os.environ.get("PP_DIAS_ATRAS", "210"))
-PP_FECHA_FIN = datetime.date.today()
-PP_FECHA_INICIO = PP_FECHA_FIN - datetime.timedelta(days=PP_DIAS_ATRAS)
-
-PP_DEPARTAMENTO_OBJETIVO = "ANTIOQUIA"
-PP_MUNICIPIO_OBJETIVO = "MEDELLÍN"
+BASE_URL_MASIFICADOS = "https://www.masificados.com/otros/avisos/judiciales/edictos"
 
 
-def construir_url_publicaciones(pagina: int) -> str:
-    params = {
-        "p_p_id": PP_PORTLET_ID,
-        "p_p_lifecycle": "0",
-        "p_p_state": "normal",
-        "p_p_mode": "view",
-        PP_NS + "idStructure": PP_ID_STRUCTURE_REMATES,
-        PP_NS + "action": "filterStructures",
-        PP_NS + "idDepto": PP_ID_DEPTO,
-        PP_NS + "verTotales": "true",
-        PP_NS + "cur": str(pagina),
-        # Hipótesis sin confirmar (ver nota arriba):
-        PP_NS + "fechaInicio": PP_FECHA_INICIO.strftime("%d/%m/%Y"),
-        PP_NS + "fechaFin": PP_FECHA_FIN.strftime("%d/%m/%Y"),
-    }
-    if PP_ID_MUNICIPIO:
-        params[PP_NS + "idMunicipio"] = PP_ID_MUNICIPIO
-    return PP_BASE_URL + "?" + urllib.parse.urlencode(params)
+def construir_url_masificados(pagina: int) -> str:
+    return f"{BASE_URL_MASIFICADOS}?max_per_page=50&search_results_view=lineal&page={pagina}"
 
 
-def descargar_publicaciones(url: str, referer: str = None) -> str:
-    headers = dict(HEADERS)
-    if referer:
-        headers["Referer"] = referer
-    req = urllib.request.Request(url, headers=headers)
-    with _pp_opener.open(req, timeout=60) as resp:
-        return resp.read().decode("utf-8", errors="ignore")
-
-
-def es_de_interes(texto: str) -> bool:
-    """Filtro de seguridad por si el filtro de Municipio no quedó aplicado
-    del lado del servidor (ver nota en la cabecera del archivo)."""
-    texto_up = texto.upper()
-    return PP_MUNICIPIO_OBJETIVO in texto_up or PP_DEPARTAMENTO_OBJETIVO in texto_up
-
-
-def extraer_publicaciones(texto: str, html: str, url_pagina: str):
+def extraer_avisos_masificados(html: str, texto: str, url_pagina: str):
     """
-    Heurística genérica para extraer registros de la página de resultados.
-
-    Se apoya en que el número de radicado judicial colombiano (formato
-    unificado) tiene 20-23 dígitos y es prácticamente único por proceso,
-    sin importar el rediseño del portal. Alrededor de cada radicado se
-    busca una fecha (dd/mm/aaaa) y el nombre del despacho.
-
-    ESTO ES UN PUNTO DE PARTIDA, no una extracción confirmada contra el
-    HTML real (ver advertencia al inicio del archivo). Actívalo con
-    DEBUG_DUMP_PP=1 y ajústalo si hace falta.
+    Cada aviso enlaza a una URL del tipo:
+      https://www.masificados.com/otros/ocasional/<id_anunciante>/aviso/<id_aviso>/
+    Esa misma URL aparece repetida más de una vez en la página (una vez
+    envolviendo la miniatura, otra con el texto del edicto), así que
+    deduplicamos por <id_aviso> y nos quedamos con el texto de ancla más
+    largo como título/resumen.
     """
+    detalle_pattern = re.compile(
+        r'href="(https://www\.masificados\.com/otros/ocasional/\d+/aviso/(\d+)/)"', re.I
+    )
+    enlaces = {}
+    for m in detalle_pattern.finditer(html):
+        href, aviso_id = m.group(1), m.group(2)
+        enlaces.setdefault(aviso_id, href)
+
     resultados = []
-    vistos = set()
+    for aviso_id, href in enlaces.items():
+        textos_ancla = re.findall(rf'href="{re.escape(href)}"[^>]*>([^<]{{10,400}})</a>', html, re.I)
+        candidatos = [t.strip() for t in textos_ancla if t.strip() and href not in t]
+        titulo = max(candidatos, key=len) if candidatos else "Ver aviso completo en el enlace"
+        titulo = re.sub(r"\s+", " ", titulo)
 
-    for m in re.finditer(r"\b(\d{20,23})\b", texto):
-        radicado = m.group(1)
-        if radicado in vistos:
-            continue
-        vistos.add(radicado)
-
-        inicio = max(0, m.start() - 300)
-        fin = min(len(texto), m.end() + 300)
-        contexto = re.sub(r"\s+", " ", texto[inicio:fin]).strip()
-
-        fecha_m = re.search(r"\b\d{1,2}/\d{1,2}/\d{4}\b", contexto)
-        despacho_m = re.search(r"(JUZGADO[^.\n]{0,80}|TRIBUNAL[^.\n]{0,80})", contexto, re.I)
+        idx = texto.find(aviso_id)
+        ventana = texto[max(0, idx - 50): idx + 400] if idx != -1 else ""
+        fecha_m = re.search(r"Publicado:\s*(\d{1,2}/\d{1,2}/\d{4})", ventana, re.I)
+        fecha_texto = fecha_m.group(1) if fecha_m else None
 
         resultados.append({
-            "radicado": radicado,
-            "fecha_texto": fecha_m.group(0) if fecha_m else "No especificada",
-            "despacho": despacho_m.group(0).strip() if despacho_m else "No especificado",
-            "detalle": contexto[:300],
-            "documento": None,
+            "id": aviso_id,
+            "titulo": titulo,
+            "fecha_texto": fecha_texto or "No especificada",
+            "fecha": parse_fecha(fecha_texto),
+            "enlace": href,
             "fuente": url_pagina,
         })
-
-    # Enlaces a PDF encontrados en la página (no se pueden asociar con
-    # certeza a un radicado específico sin ver el HTML real, así que se
-    # exponen aparte para revisión manual si hacen falta).
-    enlaces_pdf = re.findall(r'href="([^"]+\.pdf[^"]*)"', html, re.I)
-    if enlaces_pdf and resultados:
-        for i, r in enumerate(resultados):
-            if i < len(enlaces_pdf):
-                r["documento"] = enlaces_pdf[i]
-
     return resultados
 
 
-def recolectar_publicaciones_procesales():
-    resultados = []
-    referer = PP_BASE_URL
-    for pagina in range(1, MAX_PAGES_PUBLICACIONES + 1):
-        url = construir_url_publicaciones(pagina)
-        try:
-            html = descargar_publicaciones(url, referer=referer)
-        except Exception as e:
-            print(f"[Publicaciones Procesales] Error en página {pagina}: {e}")
-            break
-        referer = url
+def recolectar_masificados():
+    hoy = datetime.date.today()
+    fecha_limite = hoy - datetime.timedelta(days=MASIFICADOS_DIAS_ATRAS)
 
-        if DEBUG_DUMP_PP:
-            nombre_archivo = f"debug_publicaciones_pagina_{pagina}.html"
-            with open(nombre_archivo, "w", encoding="utf-8") as f:
-                f.write(html)
-            print(f"[Publicaciones Procesales] HTML crudo guardado en {nombre_archivo}")
+    resultados = []
+    for pagina in range(1, MAX_PAGES_MASIFICADOS + 1):
+        url = construir_url_masificados(pagina)
+        try:
+            html = descargar(url)
+        except Exception as e:
+            print(f"[Masificados] Error en página {pagina}: {e}")
+            break
 
         texto = html_a_texto(html)
-        registros = extraer_publicaciones(texto, html, url)
-        registros = [r for r in registros if es_de_interes(r["detalle"])]
-
-        if not registros:
+        avisos_pagina = extraer_avisos_masificados(html, texto, url)
+        if not avisos_pagina:
             break
-        resultados.extend(registros)
+
+        # El listado viene ordenado del más nuevo al más antiguo, así que
+        # en cuanto una página ya no trae nada dentro de la ventana de
+        # "reciente", dejamos de paginar.
+        recientes_pagina = [a for a in avisos_pagina if a["fecha"] and a["fecha"] >= fecha_limite]
+        resultados.extend(recientes_pagina)
+
+        if not recientes_pagina:
+            break
 
     vistos, unicos = set(), []
-    for r in resultados:
-        if r["radicado"] not in vistos:
-            vistos.add(r["radicado"])
-            unicos.append(r)
+    for a in resultados:
+        if a["id"] not in vistos:
+            vistos.add(a["id"])
+            unicos.append(a)
+    unicos.sort(key=lambda a: a["fecha"] or hoy, reverse=True)
     return unicos
 
 
@@ -362,7 +273,7 @@ def recolectar_publicaciones_procesales():
 # CORREO
 # =========================================================================
 
-def construir_html(remates_banagrario, avisos_publicaciones):
+def construir_html(remates_banagrario, avisos_masificados):
     hoy = datetime.date.today().isoformat()
 
     if remates_banagrario:
@@ -383,29 +294,22 @@ def construir_html(remates_banagrario, avisos_publicaciones):
     else:
         seccion_ba = "<h3>Banco Agrario</h3><p>No se encontraron remates vigentes en esta revisión.</p>"
 
-    if avisos_publicaciones:
-        filas_pp = ""
-        for a in avisos_publicaciones:
-            enlace_doc = (
-                f'<a href="{a.get("documento")}">Ver documento/aviso oficial (PDF)</a> &nbsp;|&nbsp; '
-                if a.get("documento") else ""
-            )
-            filas_pp += f"""
+    if avisos_masificados:
+        filas_ma = ""
+        for a in avisos_masificados:
+            filas_ma += f"""
             <div style="border:1px solid #ddd;border-radius:8px;padding:14px;margin-bottom:14px;">
-              <p style="margin:2px 0;"><b>Despacho:</b> {a.get('despacho')}</p>
-              <p style="margin:2px 0;"><b>Radicado:</b> {a.get('radicado')}</p>
-              <p style="margin:2px 0;"><b>Fecha:</b> {a.get('fecha_texto')}</p>
-              <p style="margin:2px 0;"><b>Detalle:</b> {a.get('detalle')}</p>
-              <p style="margin:6px 0;">{enlace_doc}<a href="{a.get('fuente')}">Ver página de resultados</a></p>
+              <p style="margin:2px 0;"><b>Aviso:</b> {a.get('titulo')}</p>
+              <p style="margin:2px 0;"><b>Publicado:</b> {a.get('fecha_texto')}</p>
+              <p style="margin:6px 0;"><a href="{a.get('enlace')}">Ver aviso completo</a></p>
             </div>
             """
-        seccion_pp = (
-            f"<h3>Publicaciones Procesales — Remates en Medellín, Antioquia ({len(avisos_publicaciones)} registro(s))</h3>"
-            f"<p style='font-size:12px;color:#888;'>Esta extracción es heurística; verifica cada registro en el enlace de la página de resultados.</p>"
-            f"{filas_pp}"
+        seccion_ma = (
+            f"<h3>Avisos Masificados (El Colombiano) — Judiciales/Edictos recientes ({len(avisos_masificados)} aviso(s))</h3>"
+            f"{filas_ma}"
         )
     else:
-        seccion_pp = "<h3>Publicaciones Procesales — Remates en Medellín, Antioquia</h3><p>No se encontraron avisos de remate en esta revisión.</p>"
+        seccion_ma = "<h3>Avisos Masificados (El Colombiano) — Judiciales/Edictos</h3><p>No se encontraron avisos recientes en esta revisión.</p>"
 
     return f"""
     <html>
@@ -413,7 +317,7 @@ def construir_html(remates_banagrario, avisos_publicaciones):
         <h2>Remates judiciales en Colombia — {hoy}</h2>
         {seccion_ba}
         <hr>
-        {seccion_pp}
+        {seccion_ma}
         <hr>
         <p style="font-size:12px;color:#888;">
           Verifica siempre la información directamente en el portal/juzgado
@@ -448,11 +352,11 @@ def main():
     remates_banagrario = recolectar_banagrario()
     print(f"Banco Agrario: {len(remates_banagrario)} remate(s) vigente(s)")
 
-    avisos_publicaciones = recolectar_publicaciones_procesales()
-    print(f"Publicaciones Procesales: {len(avisos_publicaciones)} registro(s) encontrado(s)")
+    avisos_masificados = recolectar_masificados()
+    print(f"Masificados: {len(avisos_masificados)} aviso(s) reciente(s) encontrado(s)")
 
-    html = construir_html(remates_banagrario, avisos_publicaciones)
-    enviar_correo(html, len(remates_banagrario) + len(avisos_publicaciones))
+    html = construir_html(remates_banagrario, avisos_masificados)
+    enviar_correo(html, len(remates_banagrario) + len(avisos_masificados))
 
 
 if __name__ == "__main__":
