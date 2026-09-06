@@ -217,9 +217,22 @@ PP_ID_STRUCTURE_REMATES = "6098997"
 # idDepto=" ") y el filtro real de ciudad se hace en Python sobre el texto
 # de cada resultado (ver `es_de_interes`). Si consigues el código exacto de
 # Antioquia/Medellín (por ejemplo mirando el <select> del filtro en el
-# navegador), ponlo aquí para que el portal ya venga pre-filtrado.
+# navegador, o la URL real que arma el botón "Buscar"), ponlo aquí para que
+# el portal ya venga pre-filtrado.
 PP_ID_DEPTO = " "
-PP_ID_MUNICIPIO = None  # ej: "05001" si llegas a confirmar el código de Medellín
+PP_ID_MUNICIPIO = None  # ej: "05001" si confirmas el código de Medellín
+
+# --- Rango de fechas (Fecha Inicio / Fecha Fin del filtro) ---
+# HIPÓTESIS SIN CONFIRMAR: nombres de parámetro "fechaInicio"/"fechaFin"
+# siguiendo el mismo patrón camelCase de "idDepto"/"idStructure", en
+# formato dd/mm/aaaa (igual a como se ve en el formulario). Falta
+# verificar contra la URL/petición real que dispara el botón "Buscar".
+# Por defecto se arma una ventana móvil de PP_DIAS_ATRAS días hasta hoy,
+# igual de espíritu a la ventana que trae el formulario por defecto
+# (en la captura: 05/02/2026 a 04/09/2026, ~7 meses).
+PP_DIAS_ATRAS = int(os.environ.get("PP_DIAS_ATRAS", "210"))
+PP_FECHA_FIN = datetime.date.today()
+PP_FECHA_INICIO = PP_FECHA_FIN - datetime.timedelta(days=PP_DIAS_ATRAS)
 
 PP_DEPARTAMENTO_OBJETIVO = "ANTIOQUIA"
 PP_MUNICIPIO_OBJETIVO = "MEDELLÍN"
@@ -236,6 +249,9 @@ def construir_url_publicaciones(pagina: int) -> str:
         PP_NS + "idDepto": PP_ID_DEPTO,
         PP_NS + "verTotales": "true",
         PP_NS + "cur": str(pagina),
+        # Hipótesis sin confirmar (ver nota arriba):
+        PP_NS + "fechaInicio": PP_FECHA_INICIO.strftime("%d/%m/%Y"),
+        PP_NS + "fechaFin": PP_FECHA_FIN.strftime("%d/%m/%Y"),
     }
     if PP_ID_MUNICIPIO:
         params[PP_NS + "idMunicipio"] = PP_ID_MUNICIPIO
