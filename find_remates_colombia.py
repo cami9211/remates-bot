@@ -1,29 +1,38 @@
 """
-Bot de edictos judiciales - Clasificados El Colombiano (SIN IA, 100% gratis)
+Bot de remates/subastas judiciales - Clasificados El Colombiano (SIN IA, 100% gratis)
 --------------------------------------------------------------------------------
 Fuente única: Clasificados "Judiciales / Edictos" de El Colombiano
 (masificados.com), leída directamente sin ninguna API de IA.
 
   https://www.masificados.com/otros/avisos/judiciales/edictos
 
-El listado se revisa página por página (más recientes primero) y para
-cada aviso se abre su página de detalle para extraer:
-  - El texto completo del edicto (el listado solo muestra un resumen truncado).
-  - Campos estructurados extraídos por expresiones regulares: avalúo,
-    postura mínima, fecha de remate, radicado, juzgado/entidad, ubicación,
-    dirección y secuestre.
+El listado se revisa página por página (más recientes primero). Para cada
+aviso se abre su página de detalle y se extrae el texto completo del
+edicto (el listado solo muestra un resumen truncado). Un aviso solo se
+incluye en el resultado final si cumple TODAS estas condiciones:
 
-Como esto es puro parseo de texto (sin IA), la extracción de campos es
-heurística: cuando un dato no se logra identificar en el texto del aviso,
-el campo se marca explícitamente como "No especificado en el aviso" en
-vez de omitirse o inventarse.
+  1. El texto menciona "remate" o "subasta" (en cualquier variante:
+     remate, remates, rematar, subasta, subastar, etc.).
+  2. Se le pudo extraer una fecha de remate y esa fecha es hoy o
+     posterior (se descartan remates ya vencidos o sin fecha detectable).
+
+El resultado se limita a un máximo de 20 avisos, ordenados por fecha de
+remate más próxima primero.
+
+Además, para cada aviso que pasa el filtro se extraen campos
+estructurados por expresiones regulares: avalúo, postura mínima, fecha
+de remate, radicado, juzgado/entidad, ubicación, dirección y secuestre.
+Como esto es puro parseo de texto (sin IA), la extracción es heurística:
+cuando un dato no se logra identificar, el campo se marca explícitamente
+como "No especificado en el aviso" en vez de omitirse o inventarse.
 
 Variables de entorno requeridas (Secrets en GitHub):
   GMAIL_USER, GMAIL_APP_PASSWORD, RECIPIENT_EMAIL
 
 Opcional:
-  MAX_PAGINAS_EDICTOS -> páginas del listado a revisar (default 2, 50 avisos c/u)
-  MAX_AVISOS          -> tope de avisos a abrir en detalle (default 60)
+  MAX_RESULTADOS         -> tope de remates/subastas en el resultado final (default 20)
+  MAX_PAGINAS_EDICTOS    -> páginas del listado a recorrer buscando candidatos (default 15, 50 avisos c/u)
+  MAX_AVISOS_REVISADOS   -> tope de avisos abiertos en detalle por ejecución, para no saturar el sitio (default 400)
 """
 
 import os
@@ -39,8 +48,9 @@ from email.mime.text import MIMEText
 GMAIL_USER = os.environ.get("GMAIL_USER")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
 RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", GMAIL_USER)
-MAX_PAGINAS_EDICTOS = int(os.environ.get("MAX_PAGINAS_EDICTOS", "2"))
-MAX_AVISOS = int(os.environ.get("MAX_AVISOS", "60"))
+MAX_RESULTADOS = int(os.environ.get("MAX_RESULTADOS", "20"))
+MAX_PAGINAS_EDICTOS = int(os.environ.get("MAX_PAGINAS_EDICTOS", "15"))
+MAX_AVISOS_REVISADOS = int(os.environ.get("MAX_AVISOS_REVISADOS", "400"))
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (edictos-bot; uso personal)"}
 
@@ -78,12 +88,18 @@ OG_DESCRIPTION_RE = re.compile(
 )
 RADICADO_RE = re.compile(r"radicad[oa]\s*(?:no\.?|número)?\s*:?\s*([0-9][0-9\-\.]{8,30})", re.I)
 
+# Filtro: solo nos interesan avisos que mencionen remate o subasta
+# (cubre variantes: remate, remates, rematar, rematará, subasta, subastar, etc.)
+MENCIONA_REMATE_RE = re.compile(r"remat|subast", re.I)
+
 NO_ESPECIFICADO = "No especificado en el aviso"
 
-MESES = (
-    "enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|"
-    "octubre|noviembre|diciembre"
-)
+MESES_NUM = {
+    "enero": 1, "febrero": 2, "marzo": 3, "abril": 4, "mayo": 5, "junio": 6,
+    "julio": 7, "agosto": 8, "septiembre": 9, "setiembre": 9, "octubre": 10,
+    "noviembre": 11, "diciembre": 12,
+}
+MESES = "|".join(MESES_NUM.keys())
 
 AVALUO_RE = re.compile(r"avalú[oó][^\$\n]{0,40}\$\s*([\d\.,]+)", re.I)
 POSTURA_PORCENTAJE_RE = re.compile(r"postura\s+(?:admisible|m[ií]nima)[^\d%]{0,20}(\d{1,3}\s*%)", re.I)
@@ -150,15 +166,24 @@ def extraer_postura_minima(texto):
 
 
 def extraer_fecha_remate(texto):
+    """Devuelve (fecha_obj_o_None, texto_formateado). fecha_obj es un
+    datetime.date solo cuando el día/mes/año se pudieron interpretar."""
     m = FECHA_REMATE_RE.search(texto)
     if not m:
-        return NO_ESPECIFICADO
-    dia, mes, anio = m.groups()
-    fecha_txt = f"{dia} de {mes.lower()} de {anio}"
+        return None, NO_ESPECIFICADO
+    dia, mes_txt, anio = m.groups()
+    mes_num = MESES_NUM.get(mes_txt.lower())
+    fecha_obj = None
+    if mes_num:
+        try:
+            fecha_obj = datetime.date(int(anio), mes_num, int(dia))
+        except ValueError:
+            fecha_obj = None
+    fecha_formateada = f"{dia} de {mes_txt.lower()} de {anio}"
     hora_m = HORA_REMATE_RE.search(texto)
     if hora_m:
-        fecha_txt += f", {hora_m.group(1).strip()}"
-    return fecha_txt
+        fecha_formateada += f", {hora_m.group(1).strip()}"
+    return fecha_obj, fecha_formateada
 
 
 def extraer_ubicacion(texto):
@@ -190,7 +215,6 @@ def extraer_campos(texto_descripcion, radicado_ya_extraido):
     return {
         "entidad": extraer_entidad(texto_descripcion),
         "radicado": radicado_ya_extraido or NO_ESPECIFICADO,
-        "fecha_remate": extraer_fecha_remate(texto_descripcion),
         "avaluo": extraer_avaluo(texto_descripcion),
         "postura_minima": extraer_postura_minima(texto_descripcion),
         "ubicacion": extraer_ubicacion(texto_descripcion),
@@ -199,11 +223,12 @@ def extraer_campos(texto_descripcion, radicado_ya_extraido):
     }
 
 
-def listar_ids_avisos():
+def generar_ids_avisos():
     """Recorre las páginas del listado (ya viene ordenado por más recientes)
-    y devuelve los IDs de aviso en el mismo orden, sin duplicados."""
-    ids_vistos = []
-    ids_set = set()
+    y va entregando los IDs de aviso uno por uno, sin duplicados. Al ser un
+    generador, si quien lo consume deja de pedir IDs (por ejemplo porque ya
+    completó los 20 resultados) no se siguen descargando páginas de más."""
+    ids_vistos = set()
     for pagina in range(1, MAX_PAGINAS_EDICTOS + 1):
         url_pagina = f"{BASE_URL_EDICTOS}?max_per_page=50&search_results_view=lineal&page={pagina}"
         try:
@@ -215,12 +240,9 @@ def listar_ids_avisos():
         if not encontrados:
             break
         for _id_categoria, id_aviso in encontrados:
-            if id_aviso not in ids_set:
-                ids_set.add(id_aviso)
-                ids_vistos.append(id_aviso)
-        if len(ids_vistos) >= MAX_AVISOS:
-            break
-    return ids_vistos[:MAX_AVISOS]
+            if id_aviso not in ids_vistos:
+                ids_vistos.add(id_aviso)
+                yield id_aviso
 
 
 def parse_fecha_publicado(html):
@@ -252,11 +274,19 @@ def extraer_descripcion(html):
 
 
 def recolectar_edictos():
-    ids = listar_ids_avisos()
-    print(f"[Edictos] {len(ids)} aviso(s) encontrados en el listado")
+    hoy = datetime.date.today()
+    resultados = []
+    avisos_revisados = 0
 
-    avisos = []
-    for id_aviso in ids:
+    for id_aviso in generar_ids_avisos():
+        if len(resultados) >= MAX_RESULTADOS:
+            print(f"[Edictos] Se completaron los {MAX_RESULTADOS} resultados solicitados.")
+            break
+        if avisos_revisados >= MAX_AVISOS_REVISADOS:
+            print(f"[Edictos] Se alcanzó el tope de avisos revisados ({MAX_AVISOS_REVISADOS}) sin llegar a {MAX_RESULTADOS} resultados.")
+            break
+
+        avisos_revisados += 1
         # El id de categoría exacto no es necesario para acceder al aviso;
         # el sitio redirige correctamente aunque se use un valor genérico.
         url_detalle = f"https://www.masificados.com/otros/ocasional/0/aviso/{id_aviso}/"
@@ -267,7 +297,17 @@ def recolectar_edictos():
             continue
 
         descripcion = extraer_descripcion(html)
-        fecha = parse_fecha_publicado(html)
+
+        # Filtro 1: debe mencionar remate o subasta.
+        if not MENCIONA_REMATE_RE.search(descripcion):
+            continue
+
+        # Filtro 2: debe tener una fecha de remate identificable y no vencida.
+        fecha_remate_obj, fecha_remate_texto = extraer_fecha_remate(descripcion)
+        if fecha_remate_obj is None or fecha_remate_obj < hoy:
+            continue
+
+        fecha_publicado = parse_fecha_publicado(html)
         radicado_m = RADICADO_RE.search(descripcion)
         radicado = radicado_m.group(1).strip(" .,") if radicado_m else None
         campos = extraer_campos(descripcion, radicado)
@@ -275,15 +315,17 @@ def recolectar_edictos():
         aviso = {
             "id": id_aviso,
             "descripcion": descripcion,
-            "fecha_publicado": fecha,
-            "fecha_publicado_texto": fecha.strftime("%d/%m/%Y") if fecha else NO_ESPECIFICADO,
+            "fecha_publicado_texto": fecha_publicado.strftime("%d/%m/%Y") if fecha_publicado else NO_ESPECIFICADO,
+            "fecha_remate": fecha_remate_texto,
+            "fecha_remate_obj": fecha_remate_obj,
             "link": url_detalle,
         }
         aviso.update(campos)
-        avisos.append(aviso)
+        resultados.append(aviso)
 
-    avisos.sort(key=lambda a: (a["fecha_publicado"] is None, a["fecha_publicado"]), reverse=True)
-    return avisos
+    print(f"[Edictos] {avisos_revisados} aviso(s) revisados, {len(resultados)} cumplen los filtros (remate/subasta + fecha futura)")
+    resultados.sort(key=lambda a: a["fecha_remate_obj"])
+    return resultados
 
 
 # =========================================================================
@@ -331,7 +373,7 @@ def _tarjeta_aviso(e, numero):
             <tr>
               <td style="font-size:12px; color:#ffffff; background:#1e3a5f; display:inline-block;
                          padding:4px 10px; border-radius:999px; font-weight:700;">
-                EDICTO #{numero}
+                REMATE #{numero}
               </td>
               <td style="text-align:right; font-size:12px; color:#6b7280;">
                 Publicado: <b>{e.get('fecha_publicado_texto')}</b>
@@ -378,7 +420,7 @@ def construir_html(edictos):
         <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
                style="background:#ffffff; border:1px solid #e5e7eb; border-radius:12px; padding:24px;">
           <tr><td style="font-size:14px; color:#374151;">
-            No se encontraron edictos en esta revisión.
+            No se encontraron remates o subastas con fecha futura en esta revisión.
           </td></tr>
         </table>
         """
@@ -395,10 +437,10 @@ def construir_html(edictos):
                 <tr>
                   <td style="background:#1e3a5f; border-radius:12px 12px 0 0; padding:22px 26px;">
                     <div style="font-size:20px; color:#ffffff; font-weight:800;">
-                      ⚖️ Edictos judiciales más recientes
+                      ⚖️ Remates y subastas judiciales próximos
                     </div>
                     <div style="font-size:13px; color:#c9d6e5; margin-top:4px;">
-                      Clasificados Judiciales — El Colombiano · {hoy} · {len(edictos)} aviso(s)
+                      Clasificados Judiciales — El Colombiano · {hoy} · {len(edictos)} de hasta {MAX_RESULTADOS} resultado(s)
                     </div>
                   </td>
                 </tr>
@@ -412,10 +454,13 @@ def construir_html(edictos):
                 <tr>
                   <td style="padding:6px 22px 22px 22px;">
                     <p style="font-size:11px; color:#9ca3af; line-height:1.5; margin:0;">
-                      Los campos (avalúo, postura mínima, fecha de remate, radicado, entidad,
-                      ubicación, dirección y secuestre) se extraen automáticamente del texto del
-                      aviso mediante reglas de texto, sin intervención de IA; cuando un dato no
-                      se logra identificar, el campo se marca como "No especificado en el aviso".
+                      Solo se incluyen avisos que mencionan remate o subasta y cuya fecha de
+                      remate detectada es igual o posterior a hoy ({hoy}), ordenados del más
+                      próximo al más lejano, hasta un máximo de {MAX_RESULTADOS}. Los campos
+                      (avalúo, postura mínima, fecha de remate, radicado, entidad, ubicación,
+                      dirección y secuestre) se extraen automáticamente del texto del aviso
+                      mediante reglas de texto, sin intervención de IA; cuando un dato no se
+                      logra identificar, el campo se marca como "No especificado en el aviso".
                       Verifica siempre la información directamente en el aviso original antes de
                       tomar cualquier decisión legal o financiera. Este resumen no constituye
                       asesoría legal ni financiera.
@@ -437,7 +482,7 @@ def enviar_correo(html: str, total: int):
         print("Faltan variables de correo (GMAIL_USER / GMAIL_APP_PASSWORD / RECIPIENT_EMAIL). No se envía correo.")
         return
 
-    asunto = f"Edictos judiciales El Colombiano — {total} resultado(s) — {datetime.date.today().isoformat()}"
+    asunto = f"Remates y subastas judiciales El Colombiano — {total} resultado(s) — {datetime.date.today().isoformat()}"
     msg = MIMEMultipart("alternative")
     msg["Subject"] = asunto
     msg["From"] = GMAIL_USER
@@ -453,7 +498,7 @@ def enviar_correo(html: str, total: int):
 
 def main():
     edictos = recolectar_edictos()
-    print(f"Edictos: {len(edictos)} aviso(s) recolectados")
+    print(f"Remates/subastas encontrados: {len(edictos)}")
 
     html = construir_html(edictos)
     enviar_correo(html, len(edictos))
