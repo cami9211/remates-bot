@@ -10,8 +10,12 @@ Combina dos fuentes, ambas leídas directamente sin ninguna API de IA:
      (masificados.com/otros/avisos/judiciales/edictos)
      -> Listado de edictos, emplazamientos, avisos de remate, avisos de
      liquidación patrimonial, etc. publicados por juzgados y notarías,
-     mayoritariamente de Antioquia. Solo se conservan los avisos
-     recientes (por defecto, publicados desde el día anterior).
+     mayoritariamente de Antioquia. Se recorre ordenado del más nuevo al
+     más antiguo (order_search=date_desc) y solo se conservan los avisos
+     recientes. Para cada aviso reciente se entra también a su página de
+     detalle para sacar el texto completo (no el fragmento truncado) e
+     intentar identificar el despacho y el radicado, buscando quedar al
+     mismo nivel de detalle que la sección del Banco Agrario.
 
 Variables de entorno requeridas (Secrets en GitHub):
   GMAIL_USER, GMAIL_APP_PASSWORD, RECIPIENT_EMAIL
@@ -20,6 +24,7 @@ Opcional:
   MAX_PAGES_BANCO_AGRARIO   -> páginas del Banco Agrario a revisar (default 5)
   MAX_PAGES_MASIFICADOS     -> páginas de Masificados a revisar (default 5)
   MASIFICADOS_DIAS_ATRAS    -> qué tan "reciente" es reciente, en días (default 1)
+  MASIFICADOS_MAX_DETALLES  -> tope de páginas de detalle a abrir por corrida (default 40)
 """
 
 import os
@@ -38,6 +43,7 @@ RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", GMAIL_USER)
 MAX_PAGES_BANCO_AGRARIO = int(os.environ.get("MAX_PAGES_BANCO_AGRARIO", "5"))
 MAX_PAGES_MASIFICADOS = int(os.environ.get("MAX_PAGES_MASIFICADOS", "5"))
 MASIFICADOS_DIAS_ATRAS = int(os.environ.get("MASIFICADOS_DIAS_ATRAS", "1"))
+MASIFICADOS_MAX_DETALLES = int(os.environ.get("MASIFICADOS_MAX_DETALLES", "40"))
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (remates-bot; uso personal)"}
 
@@ -188,38 +194,53 @@ def recolectar_banagrario():
 
 BASE_URL_MASIFICADOS = "https://www.masificados.com/otros/avisos/judiciales/edictos"
 
+# Patrones para identificar despacho/radicado dentro del texto completo del
+# aviso. Son heurísticas sobre texto libre (cada juzgado/notaría redacta su
+# edicto a su manera), así que no siempre van a acertar con precisión total,
+# pero cubren el vocabulario típico usado en estos avisos.
+PATRON_DESPACHO = re.compile(
+    r"(JUZGADO[^.,;\n]{0,90}|NOTAR[IÍ]A[^.,;\n]{0,90}|TRIBUNAL[^.,;\n]{0,90}|"
+    r"NOTAR[IÍ]O[^.,;\n]{0,90})",
+    re.I,
+)
+PATRON_RADICADO = re.compile(
+    r"radicad[oa]?[^\d]{0,15}([\d][\d\.\-\s]{8,35}\d)", re.I
+)
+
 
 def construir_url_masificados(pagina: int) -> str:
-    return f"{BASE_URL_MASIFICADOS}?max_per_page=50&search_results_view=lineal&page={pagina}"
-
-
-def extraer_avisos_masificados(html: str, texto: str, url_pagina: str):
-    """
-    Cada aviso enlaza a una URL del tipo:
-      https://www.masificados.com/otros/ocasional/<id_anunciante>/aviso/<id_aviso>/
-    Esa misma URL aparece repetida más de una vez en la página (una vez
-    envolviendo la miniatura, otra con el texto del edicto), así que
-    deduplicamos por <id_aviso> y nos quedamos con el texto de ancla más
-    largo como título/resumen.
-    """
-    detalle_pattern = re.compile(
-        r'href="(https://www\.masificados\.com/otros/ocasional/\d+/aviso/(\d+)/)"', re.I
+    return (
+        f"{BASE_URL_MASIFICADOS}?max_per_page=50&order_search=date_desc"
+        f"&search_results_view=lineal&page={pagina}"
     )
-    enlaces = {}
-    for m in detalle_pattern.finditer(html):
-        href, aviso_id = m.group(1), m.group(2)
-        enlaces.setdefault(aviso_id, href)
 
+
+def extraer_avisos_masificados(texto: str, url_pagina: str):
+    """
+    Extrae los avisos de una página de resultados a partir del texto ya
+    convertido con html_a_texto(). No se depende de la estructura interna
+    de las etiquetas HTML (que puede cambiar): cada aviso deja, dentro del
+    texto plano, el enlace de detalle escrito de forma literal (aparece
+    como su propio texto de ancla en la página), el fragmento truncado del
+    edicto (termina en "...") y la línea "Publicado: dd/mm/aaaa".
+    """
     resultados = []
-    for aviso_id, href in enlaces.items():
-        textos_ancla = re.findall(rf'href="{re.escape(href)}"[^>]*>([^<]{{10,400}})</a>', html, re.I)
-        candidatos = [t.strip() for t in textos_ancla if t.strip() and href not in t]
-        titulo = max(candidatos, key=len) if candidatos else "Ver aviso completo en el enlace"
-        titulo = re.sub(r"\s+", " ", titulo)
+    vistos = set()
 
-        idx = texto.find(aviso_id)
-        ventana = texto[max(0, idx - 50): idx + 400] if idx != -1 else ""
-        fecha_m = re.search(r"Publicado:\s*(\d{1,2}/\d{1,2}/\d{4})", ventana, re.I)
+    for m in re.finditer(r"https://www\.masificados\.com/otros/ocasional/\d+/aviso/(\d+)/", texto):
+        aviso_id = m.group(1)
+        if aviso_id in vistos:
+            continue
+        vistos.add(aviso_id)
+
+        inicio = max(0, m.start() - 400)
+        fin = min(len(texto), m.end() + 400)
+        bloque = texto[inicio:fin]
+
+        titulo_m = re.search(r"([^\n]{20,400}\.\.\.)", bloque)
+        titulo = re.sub(r"\s+", " ", titulo_m.group(1)).strip() if titulo_m else "Ver aviso completo en el enlace"
+
+        fecha_m = re.search(r"Publicado:\**\s*(\d{1,2}/\d{1,2}/\d{4})", bloque)
         fecha_texto = fecha_m.group(1) if fecha_m else None
 
         resultados.append({
@@ -227,10 +248,45 @@ def extraer_avisos_masificados(html: str, texto: str, url_pagina: str):
             "titulo": titulo,
             "fecha_texto": fecha_texto or "No especificada",
             "fecha": parse_fecha(fecha_texto),
-            "enlace": href,
+            "enlace": m.group(0),
             "fuente": url_pagina,
         })
     return resultados
+
+
+def extraer_detalle_aviso(url_detalle: str) -> dict:
+    """
+    Entra a la página individual del aviso y saca el texto completo del
+    edicto (no el fragmento truncado de la lista), más el despacho y el
+    radicado si se logran identificar dentro de ese texto.
+    """
+    try:
+        html = descargar(url_detalle)
+    except Exception as e:
+        print(f"[Masificados] Error al abrir detalle {url_detalle}: {e}")
+        return {"texto_completo": None, "juzgado": "No especificado", "radicado": "No especificado"}
+
+    texto = html_a_texto(html)
+
+    m_inicio = re.search(r"(E\s*D\s*I\s*C\s*T\s*O|AVISO|JUZGADO|NOTAR[IÍ]A|TRIBUNAL|CARTEL)", texto, re.I)
+    cuerpo = texto[m_inicio.start():] if m_inicio else texto
+
+    # Se corta el cuerpo antes de secciones típicas de pie/relacionados,
+    # si aparecen, para no arrastrar ruido de navegación del sitio.
+    cuerpo = re.split(
+        r"\n\s*(Enviar a un amigo|Marcar como favorito|Avisos relacionados|Comentarios|Compartir)",
+        cuerpo, maxsplit=1, flags=re.I,
+    )[0]
+    cuerpo = re.sub(r"\s+", " ", cuerpo).strip()
+
+    despacho_m = PATRON_DESPACHO.search(cuerpo)
+    radicado_m = PATRON_RADICADO.search(cuerpo)
+
+    return {
+        "texto_completo": cuerpo[:1500] if cuerpo else None,
+        "juzgado": despacho_m.group(0).strip() if despacho_m else "No especificado",
+        "radicado": radicado_m.group(1).strip() if radicado_m else "No especificado",
+    }
 
 
 def recolectar_masificados():
@@ -247,13 +303,13 @@ def recolectar_masificados():
             break
 
         texto = html_a_texto(html)
-        avisos_pagina = extraer_avisos_masificados(html, texto, url)
+        avisos_pagina = extraer_avisos_masificados(texto, url)
         if not avisos_pagina:
             break
 
-        # El listado viene ordenado del más nuevo al más antiguo, así que
-        # en cuanto una página ya no trae nada dentro de la ventana de
-        # "reciente", dejamos de paginar.
+        # El listado viene ordenado del más nuevo al más antiguo
+        # (order_search=date_desc), así que en cuanto una página ya no
+        # trae nada dentro de la ventana de "reciente", dejamos de paginar.
         recientes_pagina = [a for a in avisos_pagina if a["fecha"] and a["fecha"] >= fecha_limite]
         resultados.extend(recientes_pagina)
 
@@ -266,6 +322,17 @@ def recolectar_masificados():
             vistos.add(a["id"])
             unicos.append(a)
     unicos.sort(key=lambda a: a["fecha"] or hoy, reverse=True)
+
+    # Se completa cada aviso reciente con el texto completo/despacho/radicado
+    # de su página de detalle, respetando el tope MASIFICADOS_MAX_DETALLES.
+    for a in unicos[:MASIFICADOS_MAX_DETALLES]:
+        detalle = extraer_detalle_aviso(a["enlace"])
+        a.update(detalle)
+    for a in unicos[MASIFICADOS_MAX_DETALLES:]:
+        a["texto_completo"] = None
+        a["juzgado"] = "No especificado"
+        a["radicado"] = "No especificado"
+
     return unicos
 
 
@@ -297,10 +364,13 @@ def construir_html(remates_banagrario, avisos_masificados):
     if avisos_masificados:
         filas_ma = ""
         for a in avisos_masificados:
+            texto_mostrar = a.get("texto_completo") or a.get("titulo")
             filas_ma += f"""
             <div style="border:1px solid #ddd;border-radius:8px;padding:14px;margin-bottom:14px;">
-              <p style="margin:2px 0;"><b>Aviso:</b> {a.get('titulo')}</p>
+              <p style="margin:2px 0;"><b>Despacho:</b> {a.get('juzgado', 'No especificado')}</p>
+              <p style="margin:2px 0;"><b>Radicado:</b> {a.get('radicado', 'No especificado')}</p>
               <p style="margin:2px 0;"><b>Publicado:</b> {a.get('fecha_texto')}</p>
+              <p style="margin:2px 0;"><b>Texto del aviso:</b> {texto_mostrar}</p>
               <p style="margin:6px 0;"><a href="{a.get('enlace')}">Ver aviso completo</a></p>
             </div>
             """
