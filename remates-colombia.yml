@@ -2,10 +2,8 @@ name: Remates judiciales Colombia
 
 on:
   schedule:
-    # Horas en UTC. Colombia = UTC-5 (sin horario de verano).
-    # Este cron corre a las 8:00, 12:00 y 16:00 hora Colombia (13:00, 17:00, 21:00 UTC).
     - cron: "0 13,17,21 * * *"
-  workflow_dispatch: {}   # permite ejecutarlo manualmente desde la pestaña "Actions"
+  workflow_dispatch: {}
 
 jobs:
   buscar-remates:
