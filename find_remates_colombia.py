@@ -30,10 +30,10 @@ from email.mime.text import MIMEText
 import urllib.request
 import urllib.error
 
-ANTHROPIC_API_KEY_REMATESBOT = os.environ.get("ANTHROPIC_API_KEY_REMATESBOT")
-GMAIL_USER_REMATESBOT = os.environ.get("GMAIL_USER_REMATESBOT")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+GMAIL_USER = os.environ.get("GMAIL_USER")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
-RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", GMAIL_USER_REMATESBOT)
+RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", GMAIL_USER)
 MODEL = os.environ.get("MODEL", "claude-sonnet-4-6")
 
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
