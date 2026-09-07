@@ -1,23 +1,41 @@
 """
-Bot de remates/subastas judiciales - Clasificados El Colombiano (SIN IA, 100% gratis)
+Bot de remates/subastas judiciales (SIN IA, 100% gratis)
 --------------------------------------------------------------------------------
-Fuente única: Clasificados "Judiciales / Edictos" de El Colombiano
-(masificados.com), leída directamente sin ninguna API de IA.
+Dos fuentes, leídas directamente sin ninguna API de IA:
 
-  https://www.masificados.com/otros/avisos/judiciales/edictos
+  1) Clasificados "Judiciales / Edictos" de El Colombiano (masificados.com)
+     https://www.masificados.com/otros/avisos/judiciales/edictos
 
-El listado se revisa página por página (más recientes primero). Para cada
-aviso se abre su página de detalle y se extrae el texto completo del
-edicto (el listado solo muestra un resumen truncado). Un aviso solo se
-incluye en el resultado final si cumple TODAS estas condiciones:
+  2) Buscador de Edictos de Asuntos Legales / La República, filtrando por
+     la categoría REMATES
+     https://www.asuntoslegales.com.co/edictos
+
+Para El Colombiano el listado se revisa página por página (más recientes
+primero) y se abre cada aviso en detalle para extraer el texto completo
+(el listado solo muestra un resumen truncado).
+
+Para Asuntos Legales no existe una URL de listado paginado de solo
+lectura (el buscador visible funciona con JavaScript), así que en su
+lugar se hace un rastreo por enlaces: cada página de detalle
+(/edictos/detalle/<id>) trae al final un bloque "MÁS EDICTOS Y AVISOS
+LEGALES" con enlaces "Continuar leyendo" hacia otros avisos recientes.
+Partiendo de unos pocos avisos semilla, el bot sigue esos enlaces en
+cadena (una cola de IDs por visitar) y se queda solo con los avisos cuya
+categoría propia sea "REMATES". NOTA: este rastreo depende de que el
+sitio siga mostrando ese bloque de enlaces con la misma estructura; si
+Asuntos Legales cambia el diseño de la página, el patrón de extracción
+(AL_BLOQUE_RE más abajo) puede necesitar ajuste.
+
+En ambas fuentes, un aviso solo se incluye en el resultado final si
+cumple TODAS estas condiciones:
 
   1. El texto menciona "remate" o "subasta" (en cualquier variante:
      remate, remates, rematar, subasta, subastar, etc.).
   2. Se le pudo extraer una fecha de remate y esa fecha es hoy o
      posterior (se descartan remates ya vencidos o sin fecha detectable).
 
-El resultado se limita a un máximo de 20 avisos, ordenados por fecha de
-remate más próxima primero.
+El resultado combinado (de ambas fuentes) se limita a un máximo de 20
+avisos, ordenados por fecha de remate más próxima primero.
 
 Además, para cada aviso que pasa el filtro se extraen campos
 estructurados por expresiones regulares: avalúo, postura mínima, fecha
@@ -30,9 +48,10 @@ Variables de entorno requeridas (Secrets en GitHub):
   GMAIL_USER, GMAIL_APP_PASSWORD, RECIPIENT_EMAIL
 
 Opcional:
-  MAX_RESULTADOS         -> tope de remates/subastas en el resultado final (default 20)
-  MAX_PAGINAS_EDICTOS    -> páginas del listado a recorrer buscando candidatos (default 15, 50 avisos c/u)
-  MAX_AVISOS_REVISADOS   -> tope de avisos abiertos en detalle por ejecución, para no saturar el sitio (default 400)
+  MAX_RESULTADOS           -> tope combinado de remates/subastas en el resultado final (default 20)
+  MAX_PAGINAS_EDICTOS      -> páginas del listado de El Colombiano a recorrer (default 15, 50 avisos c/u)
+  MAX_AVISOS_REVISADOS     -> tope de avisos de El Colombiano abiertos en detalle por ejecución (default 400)
+  MAX_AVISOS_REVISADOS_AL  -> tope de avisos de Asuntos Legales visitados durante el rastreo por enlaces (default 300)
 """
 
 import os
@@ -51,6 +70,7 @@ RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", GMAIL_USER)
 MAX_RESULTADOS = int(os.environ.get("MAX_RESULTADOS", "20"))
 MAX_PAGINAS_EDICTOS = int(os.environ.get("MAX_PAGINAS_EDICTOS", "15"))
 MAX_AVISOS_REVISADOS = int(os.environ.get("MAX_AVISOS_REVISADOS", "400"))
+MAX_AVISOS_REVISADOS_AL = int(os.environ.get("MAX_AVISOS_REVISADOS_AL", "300"))
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (edictos-bot; uso personal)"}
 
@@ -319,11 +339,129 @@ def recolectar_edictos():
             "fecha_remate": fecha_remate_texto,
             "fecha_remate_obj": fecha_remate_obj,
             "link": url_detalle,
+            "fuente": "Clasificados El Colombiano",
         }
         aviso.update(campos)
         resultados.append(aviso)
 
     print(f"[Edictos] {avisos_revisados} aviso(s) revisados, {len(resultados)} cumplen los filtros (remate/subasta + fecha futura)")
+    resultados.sort(key=lambda a: a["fecha_remate_obj"])
+    return resultados
+
+
+# =========================================================================
+# ASUNTOS LEGALES (LA REPÚBLICA) - BUSCADOR DE EDICTOS, CATEGORÍA "REMATES"
+# =========================================================================
+
+AL_BASE_URL = "https://www.asuntoslegales.com.co"
+
+# Cada aviso vive en /edictos/detalle/<id>, con ids del tipo "003_VEF_17306-1-1".
+AL_DETALLE_ID_RE = re.compile(r"/edictos/detalle/([A-Za-z0-9_\-]+)")
+
+# Bloque principal de una página de detalle: justo debajo del título
+# "Edictos y Avisos Legales" viene la categoría propia del aviso (p. ej.
+# "REMATES", "NOTARIAS", "ART 450"), luego su fecha propia, y después el
+# texto completo, hasta llegar al bloque de publicidad
+# ("¿Quiere publicar su edicto en línea?") o a la sección de sugeridos
+# ("MÁS EDICTOS Y AVISOS LEGALES").
+AL_BLOQUE_RE = re.compile(
+    r"Edictos y Avisos Legales\s*\n"
+    r"(?:[\s\-]*\n)*"
+    r"([A-ZÁÉÍÓÚÑ0-9][A-ZÁÉÍÓÚÑ0-9 ]{2,25})\s*\n+"
+    r"(\d{1,2} de [a-záéíóúñ]+ de \d{4})\s*\n+"
+    r"(.*?)"
+    r"\n+\s*(?:¿Quiere publicar su edicto en línea\?|MÁS EDICTOS Y AVISOS LEGALES)",
+    re.S,
+)
+
+# Avisos semilla desde los que arranca el rastreo por enlaces (ver
+# explicación al inicio del archivo). Sirven solo como punto de partida;
+# el bot descubre el resto siguiendo los enlaces "Continuar leyendo".
+# Si el sitio los retira o cambia el formato de sus ids, se recomienda
+# reemplazarlos por ids de avisos vigentes tomados del propio sitio.
+AL_SEMILLAS = [
+    "003_VEF_17306-1-1",
+    "002_VEF_27226-1-1",
+    "009_VEF_4557-6-1",
+    "008_VEF_4071-2-1",
+    "003_VEF_16383-11-1",
+]
+
+CATEGORIA_REMATES = "REMATES"
+
+
+def extraer_bloque_asuntoslegales(html):
+    """Devuelve (categoria, fecha_publicado_texto, cuerpo_completo) del
+    aviso propio de una página de detalle de Asuntos Legales, o
+    (None, None, None) si no se pudo reconocer el patrón esperado."""
+    texto = html_a_texto(html)
+    m = AL_BLOQUE_RE.search(texto)
+    if not m:
+        return None, None, None
+    categoria = m.group(1).strip()
+    fecha_publicado_texto = m.group(2).strip()
+    cuerpo = re.sub(r"\s+", " ", m.group(3)).strip()
+    return categoria, fecha_publicado_texto, cuerpo
+
+
+def recolectar_remates_asuntoslegales():
+    """Rastrea Asuntos Legales siguiendo los enlaces "Continuar leyendo"
+    entre avisos (no hay un listado paginado de solo lectura), y se
+    queda con los avisos de la categoría REMATES que mencionen
+    remate/subasta y tengan fecha de remate futura."""
+    hoy = datetime.date.today()
+    resultados = []
+    visitados = set()
+    cola = list(AL_SEMILLAS)
+    avisos_revisados = 0
+
+    while cola and avisos_revisados < MAX_AVISOS_REVISADOS_AL:
+        id_aviso = cola.pop(0)
+        if id_aviso in visitados:
+            continue
+        visitados.add(id_aviso)
+        avisos_revisados += 1
+
+        url_detalle = f"{AL_BASE_URL}/edictos/detalle/{id_aviso}"
+        try:
+            html = descargar(url_detalle)
+        except Exception as e:
+            print(f"[AsuntosLegales] Error abriendo {id_aviso}: {e}")
+            continue
+
+        # Alimentar la cola con los avisos enlazados en "MÁS EDICTOS Y
+        # AVISOS LEGALES" para seguir rastreando, sin duplicados.
+        for nuevo_id in AL_DETALLE_ID_RE.findall(html):
+            if nuevo_id not in visitados and nuevo_id not in cola:
+                cola.append(nuevo_id)
+
+        categoria, fecha_publicado_texto, cuerpo = extraer_bloque_asuntoslegales(html)
+        if not categoria or categoria.upper() != CATEGORIA_REMATES:
+            continue
+        if not cuerpo or not MENCIONA_REMATE_RE.search(cuerpo):
+            continue
+
+        fecha_remate_obj, fecha_remate_texto = extraer_fecha_remate(cuerpo)
+        if fecha_remate_obj is None or fecha_remate_obj < hoy:
+            continue
+
+        radicado_m = RADICADO_RE.search(cuerpo)
+        radicado = radicado_m.group(1).strip(" .,") if radicado_m else None
+        campos = extraer_campos(cuerpo, radicado)
+
+        aviso = {
+            "id": id_aviso,
+            "descripcion": cuerpo,
+            "fecha_publicado_texto": fecha_publicado_texto or NO_ESPECIFICADO,
+            "fecha_remate": fecha_remate_texto,
+            "fecha_remate_obj": fecha_remate_obj,
+            "link": url_detalle,
+            "fuente": "Asuntos Legales",
+        }
+        aviso.update(campos)
+        resultados.append(aviso)
+
+    print(f"[AsuntosLegales] {avisos_revisados} aviso(s) revisados, {len(resultados)} remates cumplen los filtros")
     resultados.sort(key=lambda a: a["fecha_remate_obj"])
     return resultados
 
@@ -362,6 +500,8 @@ def _tarjeta_aviso(e, numero):
         _campo_html("👤", "Secuestre", e.get("secuestre")),
     ])
 
+    fuente = e.get("fuente", NO_ESPECIFICADO)
+
     return f"""
     <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
            style="background:#ffffff; border:1px solid #e5e7eb; border-radius:12px;
@@ -376,7 +516,7 @@ def _tarjeta_aviso(e, numero):
                 REMATE #{numero}
               </td>
               <td style="text-align:right; font-size:12px; color:#6b7280;">
-                Publicado: <b>{e.get('fecha_publicado_texto')}</b>
+                {fuente} · Publicado: <b>{e.get('fecha_publicado_texto')}</b>
               </td>
             </tr>
           </table>
@@ -399,7 +539,7 @@ def _tarjeta_aviso(e, numero):
             <a href="{e.get('link')}"
                style="display:inline-block; font-size:13px; font-weight:700; color:#1e3a5f;
                       text-decoration:none; border:1px solid #1e3a5f; padding:8px 14px; border-radius:8px;">
-              Ver aviso original en Masificados / El Colombiano →
+              Ver aviso original en {fuente} →
             </a>
           </div>
 
@@ -454,16 +594,18 @@ def construir_html(edictos):
                 <tr>
                   <td style="padding:6px 22px 22px 22px;">
                     <p style="font-size:11px; color:#9ca3af; line-height:1.5; margin:0;">
-                      Solo se incluyen avisos que mencionan remate o subasta y cuya fecha de
-                      remate detectada es igual o posterior a hoy ({hoy}), ordenados del más
-                      próximo al más lejano, hasta un máximo de {MAX_RESULTADOS}. Los campos
-                      (avalúo, postura mínima, fecha de remate, radicado, entidad, ubicación,
-                      dirección y secuestre) se extraen automáticamente del texto del aviso
-                      mediante reglas de texto, sin intervención de IA; cuando un dato no se
-                      logra identificar, el campo se marca como "No especificado en el aviso".
-                      Verifica siempre la información directamente en el aviso original antes de
-                      tomar cualquier decisión legal o financiera. Este resumen no constituye
-                      asesoría legal ni financiera.
+                      Fuentes: Clasificados Judiciales de El Colombiano y categoría REMATES del
+                      buscador de Edictos de Asuntos Legales (La República). Solo se incluyen
+                      avisos que mencionan remate o subasta y cuya fecha de remate detectada es
+                      igual o posterior a hoy ({hoy}), ordenados del más próximo al más lejano,
+                      hasta un máximo combinado de {MAX_RESULTADOS}. Los campos (avalúo, postura
+                      mínima, fecha de remate, radicado, entidad, ubicación, dirección y
+                      secuestre) se extraen automáticamente del texto del aviso mediante reglas
+                      de texto, sin intervención de IA; cuando un dato no se logra identificar,
+                      el campo se marca como "No especificado en el aviso". Verifica siempre la
+                      información directamente en el aviso original antes de tomar cualquier
+                      decisión legal o financiera. Este resumen no constituye asesoría legal ni
+                      financiera.
                     </p>
                   </td>
                 </tr>
@@ -497,8 +639,17 @@ def enviar_correo(html: str, total: int):
 
 
 def main():
-    edictos = recolectar_edictos()
-    print(f"Remates/subastas encontrados: {len(edictos)}")
+    edictos_colombiano = recolectar_edictos()
+    edictos_asuntoslegales = recolectar_remates_asuntoslegales()
+
+    edictos = edictos_colombiano + edictos_asuntoslegales
+    edictos.sort(key=lambda a: a["fecha_remate_obj"])
+    edictos = edictos[:MAX_RESULTADOS]
+
+    print(
+        f"Remates/subastas encontrados: {len(edictos)} "
+        f"(El Colombiano: {len(edictos_colombiano)}, Asuntos Legales: {len(edictos_asuntoslegales)})"
+    )
 
     html = construir_html(edictos)
     enviar_correo(html, len(edictos))
