@@ -1,34 +1,37 @@
 """
 Bot de remates/subastas judiciales (SIN IA, 100% gratis)
 --------------------------------------------------------------------------------
-Una sola fuente, leída directamente sin ninguna API de IA:
+Fuente única, leída directamente sin ninguna API de IA:
 
   Buscador de Edictos de Asuntos Legales / La República, filtrando por
   la categoría REMATES
   https://www.asuntoslegales.com.co/edictos
 
-No existe una URL de listado paginado de solo lectura (el buscador
-visible funciona con JavaScript), así que en su lugar se hace un
-rastreo por enlaces: cada página de detalle (/edictos/detalle/<id>)
-trae al final un bloque "MÁS EDICTOS Y AVISOS LEGALES" con enlaces
-"Continuar leyendo" hacia otros avisos recientes. Partiendo de unos
-pocos avisos semilla, el bot sigue esos enlaces en cadena (una cola de
-IDs por visitar) y se queda solo con los avisos cuya categoría propia
-sea "REMATES". NOTA: este rastreo depende de que el sitio siga
-mostrando ese bloque de enlaces con la misma estructura; si Asuntos
-Legales cambia el diseño de la página, el patrón de extracción
+Para Asuntos Legales no existe una URL de listado paginado de solo
+lectura (el buscador visible funciona con JavaScript), así que en su
+lugar se hace un rastreo por enlaces: cada página de detalle
+(/edictos/detalle/<id>) trae al final un bloque "MÁS EDICTOS Y AVISOS
+LEGALES" con enlaces "Continuar leyendo" hacia otros avisos recientes.
+Partiendo de unos pocos avisos semilla, el bot sigue esos enlaces en
+cadena (una cola de IDs por visitar) y se queda solo con los avisos cuya
+categoría propia sea "REMATES". NOTA: este rastreo depende de que el
+sitio siga mostrando ese bloque de enlaces con la misma estructura; si
+Asuntos Legales cambia el diseño de la página, el patrón de extracción
 (AL_BLOQUE_RE más abajo) puede necesitar ajuste.
 
 Un aviso solo se incluye en el resultado final si cumple TODAS estas
 condiciones:
 
-  1. El texto menciona "remate" o "subasta" (en cualquier variante:
+  1. Su categoría propia dentro de Asuntos Legales es "REMATES".
+  2. El texto menciona "remate" o "subasta" (en cualquier variante:
      remate, remates, rematar, subasta, subastar, etc.).
-  2. Se le pudo extraer una fecha de remate y esa fecha es hoy o
+  3. Se le pudo extraer una fecha de remate y esa fecha es hoy o
      posterior (se descartan remates ya vencidos o sin fecha detectable).
 
-El resultado se limita a un máximo de 20 avisos, ordenados por fecha
-de remate más próxima primero.
+El resultado se limita a un máximo de 6 avisos, ordenados por fecha de
+remate más próxima primero. La búsqueda se detiene en cuanto se
+completan esos 6 (o se agotan los avisos por revisar), para que la
+ejecución sea rápida.
 
 Además, para cada aviso que pasa el filtro se extraen campos
 estructurados por expresiones regulares: avalúo, postura mínima, fecha
@@ -41,8 +44,8 @@ Variables de entorno requeridas (Secrets en GitHub):
   GMAIL_USER, GMAIL_APP_PASSWORD, RECIPIENT_EMAIL
 
 Opcional:
-  MAX_RESULTADOS           -> tope de remates/subastas en el resultado final (default 20)
-  MAX_AVISOS_REVISADOS_AL  -> tope de avisos de Asuntos Legales visitados durante el rastreo por enlaces (default 300)
+  MAX_RESULTADOS           -> tope de remates/subastas en el resultado final (default 6)
+  MAX_AVISOS_REVISADOS_AL  -> tope de avisos de Asuntos Legales visitados durante el rastreo por enlaces (default 150)
 """
 
 import os
@@ -58,8 +61,8 @@ from email.mime.text import MIMEText
 GMAIL_USER = os.environ.get("GMAIL_USER")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
 RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", GMAIL_USER)
-MAX_RESULTADOS = int(os.environ.get("MAX_RESULTADOS", "20"))
-MAX_AVISOS_REVISADOS_AL = int(os.environ.get("MAX_AVISOS_REVISADOS_AL", "300"))
+MAX_RESULTADOS = int(os.environ.get("MAX_RESULTADOS", "6"))
+MAX_AVISOS_REVISADOS_AL = int(os.environ.get("MAX_AVISOS_REVISADOS_AL", "150"))
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (edictos-bot; uso personal)"}
 
@@ -80,10 +83,6 @@ def html_a_texto(html: str) -> str:
     texto = re.sub(r"\n{2,}", "\n\n", texto)
     return texto.strip()
 
-
-# =========================================================================
-# PATRONES DE EXTRACCIÓN COMPARTIDOS
-# =========================================================================
 
 RADICADO_RE = re.compile(r"radicad[oa]\s*(?:no\.?|número)?\s*:?\s*([0-9][0-9\-\.]{8,30})", re.I)
 
@@ -289,6 +288,9 @@ def recolectar_remates_asuntoslegales():
     avisos_revisados = 0
 
     while cola and avisos_revisados < MAX_AVISOS_REVISADOS_AL:
+        if len(resultados) >= MAX_RESULTADOS:
+            print(f"[AsuntosLegales] Se completaron los {MAX_RESULTADOS} resultados solicitados.")
+            break
         id_aviso = cola.pop(0)
         if id_aviso in visitados:
             continue
@@ -453,7 +455,7 @@ def construir_html(edictos):
                       ⚖️ Remates y subastas judiciales próximos
                     </div>
                     <div style="font-size:13px; color:#c9d6e5; margin-top:4px;">
-                      Asuntos Legales (La República) · {hoy} · {len(edictos)} de hasta {MAX_RESULTADOS} resultado(s)
+                      Categoría REMATES — Asuntos Legales (La República) · {hoy} · {len(edictos)} de hasta {MAX_RESULTADOS} resultado(s)
                     </div>
                   </td>
                 </tr>
@@ -468,16 +470,16 @@ def construir_html(edictos):
                   <td style="padding:6px 22px 22px 22px;">
                     <p style="font-size:11px; color:#9ca3af; line-height:1.5; margin:0;">
                       Fuente: categoría REMATES del buscador de Edictos de Asuntos Legales
-                      (La República). Solo se incluyen avisos que mencionan remate o subasta y
-                      cuya fecha de remate detectada es igual o posterior a hoy ({hoy}), ordenados
-                      del más próximo al más lejano, hasta un máximo de {MAX_RESULTADOS}. Los campos (avalúo, postura
-                      mínima, fecha de remate, radicado, entidad, ubicación, dirección y
-                      secuestre) se extraen automáticamente del texto del aviso mediante reglas
-                      de texto, sin intervención de IA; cuando un dato no se logra identificar,
-                      el campo se marca como "No especificado en el aviso". Verifica siempre la
-                      información directamente en el aviso original antes de tomar cualquier
-                      decisión legal o financiera. Este resumen no constituye asesoría legal ni
-                      financiera.
+                      (La República). Solo se incluyen avisos de esa categoría que mencionan
+                      remate o subasta y cuya fecha de remate detectada es igual o posterior a
+                      hoy ({hoy}), ordenados del más próximo al más lejano, hasta un máximo de
+                      {MAX_RESULTADOS}. Los campos (avalúo, postura mínima, fecha de remate,
+                      radicado, entidad, ubicación, dirección y secuestre) se extraen
+                      automáticamente del texto del aviso mediante reglas de texto, sin
+                      intervención de IA; cuando un dato no se logra identificar, el campo se
+                      marca como "No especificado en el aviso". Verifica siempre la información
+                      directamente en el aviso original antes de tomar cualquier decisión legal
+                      o financiera. Este resumen no constituye asesoría legal ni financiera.
                     </p>
                   </td>
                 </tr>
@@ -496,7 +498,7 @@ def enviar_correo(html: str, total: int):
         print("Faltan variables de correo (GMAIL_USER / GMAIL_APP_PASSWORD / RECIPIENT_EMAIL). No se envía correo.")
         return
 
-    asunto = f"Remates y subastas judiciales (Asuntos Legales) — {total} resultado(s) — {datetime.date.today().isoformat()}"
+    asunto = f"Remates y subastas judiciales — {total} resultado(s) — {datetime.date.today().isoformat()}"
     msg = MIMEMultipart("alternative")
     msg["Subject"] = asunto
     msg["From"] = GMAIL_USER
@@ -512,9 +514,10 @@ def enviar_correo(html: str, total: int):
 
 def main():
     edictos = recolectar_remates_asuntoslegales()
+    edictos.sort(key=lambda a: a["fecha_remate_obj"])
     edictos = edictos[:MAX_RESULTADOS]
 
-    print(f"Remates/subastas encontrados en Asuntos Legales: {len(edictos)}")
+    print(f"Remates/subastas encontrados: {len(edictos)} (Asuntos Legales)")
 
     html = construir_html(edictos)
     enviar_correo(html, len(edictos))
