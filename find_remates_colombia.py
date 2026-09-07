@@ -1,41 +1,34 @@
 """
 Bot de remates/subastas judiciales (SIN IA, 100% gratis)
 --------------------------------------------------------------------------------
-Dos fuentes, leídas directamente sin ninguna API de IA:
+Una sola fuente, leída directamente sin ninguna API de IA:
 
-  1) Clasificados "Judiciales / Edictos" de El Colombiano (masificados.com)
-     https://www.masificados.com/otros/avisos/judiciales/edictos
+  Buscador de Edictos de Asuntos Legales / La República, filtrando por
+  la categoría REMATES
+  https://www.asuntoslegales.com.co/edictos
 
-  2) Buscador de Edictos de Asuntos Legales / La República, filtrando por
-     la categoría REMATES
-     https://www.asuntoslegales.com.co/edictos
-
-Para El Colombiano el listado se revisa página por página (más recientes
-primero) y se abre cada aviso en detalle para extraer el texto completo
-(el listado solo muestra un resumen truncado).
-
-Para Asuntos Legales no existe una URL de listado paginado de solo
-lectura (el buscador visible funciona con JavaScript), así que en su
-lugar se hace un rastreo por enlaces: cada página de detalle
-(/edictos/detalle/<id>) trae al final un bloque "MÁS EDICTOS Y AVISOS
-LEGALES" con enlaces "Continuar leyendo" hacia otros avisos recientes.
-Partiendo de unos pocos avisos semilla, el bot sigue esos enlaces en
-cadena (una cola de IDs por visitar) y se queda solo con los avisos cuya
-categoría propia sea "REMATES". NOTA: este rastreo depende de que el
-sitio siga mostrando ese bloque de enlaces con la misma estructura; si
-Asuntos Legales cambia el diseño de la página, el patrón de extracción
+No existe una URL de listado paginado de solo lectura (el buscador
+visible funciona con JavaScript), así que en su lugar se hace un
+rastreo por enlaces: cada página de detalle (/edictos/detalle/<id>)
+trae al final un bloque "MÁS EDICTOS Y AVISOS LEGALES" con enlaces
+"Continuar leyendo" hacia otros avisos recientes. Partiendo de unos
+pocos avisos semilla, el bot sigue esos enlaces en cadena (una cola de
+IDs por visitar) y se queda solo con los avisos cuya categoría propia
+sea "REMATES". NOTA: este rastreo depende de que el sitio siga
+mostrando ese bloque de enlaces con la misma estructura; si Asuntos
+Legales cambia el diseño de la página, el patrón de extracción
 (AL_BLOQUE_RE más abajo) puede necesitar ajuste.
 
-En ambas fuentes, un aviso solo se incluye en el resultado final si
-cumple TODAS estas condiciones:
+Un aviso solo se incluye en el resultado final si cumple TODAS estas
+condiciones:
 
   1. El texto menciona "remate" o "subasta" (en cualquier variante:
      remate, remates, rematar, subasta, subastar, etc.).
   2. Se le pudo extraer una fecha de remate y esa fecha es hoy o
      posterior (se descartan remates ya vencidos o sin fecha detectable).
 
-El resultado combinado (de ambas fuentes) se limita a un máximo de 20
-avisos, ordenados por fecha de remate más próxima primero.
+El resultado se limita a un máximo de 20 avisos, ordenados por fecha
+de remate más próxima primero.
 
 Además, para cada aviso que pasa el filtro se extraen campos
 estructurados por expresiones regulares: avalúo, postura mínima, fecha
@@ -48,9 +41,7 @@ Variables de entorno requeridas (Secrets en GitHub):
   GMAIL_USER, GMAIL_APP_PASSWORD, RECIPIENT_EMAIL
 
 Opcional:
-  MAX_RESULTADOS           -> tope combinado de remates/subastas en el resultado final (default 20)
-  MAX_PAGINAS_EDICTOS      -> páginas del listado de El Colombiano a recorrer (default 15, 50 avisos c/u)
-  MAX_AVISOS_REVISADOS     -> tope de avisos de El Colombiano abiertos en detalle por ejecución (default 400)
+  MAX_RESULTADOS           -> tope de remates/subastas en el resultado final (default 20)
   MAX_AVISOS_REVISADOS_AL  -> tope de avisos de Asuntos Legales visitados durante el rastreo por enlaces (default 300)
 """
 
@@ -68,8 +59,6 @@ GMAIL_USER = os.environ.get("GMAIL_USER")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
 RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", GMAIL_USER)
 MAX_RESULTADOS = int(os.environ.get("MAX_RESULTADOS", "20"))
-MAX_PAGINAS_EDICTOS = int(os.environ.get("MAX_PAGINAS_EDICTOS", "15"))
-MAX_AVISOS_REVISADOS = int(os.environ.get("MAX_AVISOS_REVISADOS", "400"))
 MAX_AVISOS_REVISADOS_AL = int(os.environ.get("MAX_AVISOS_REVISADOS_AL", "300"))
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (edictos-bot; uso personal)"}
@@ -93,19 +82,9 @@ def html_a_texto(html: str) -> str:
 
 
 # =========================================================================
-# CLASIFICADOS EL COLOMBIANO - JUDICIALES / EDICTOS
+# PATRONES DE EXTRACCIÓN COMPARTIDOS
 # =========================================================================
 
-BASE_URL_EDICTOS = "https://www.masificados.com/otros/avisos/judiciales/edictos"
-
-# Cada aviso vive en /otros/ocasional/{id_categoria}/aviso/{id_aviso}/
-AVISO_URL_RE = re.compile(r"/otros/ocasional/(\d+)/aviso/(\d+)/")
-
-FECHA_PUBLICADO_RE = re.compile(r"Publicado:\s*(\d{2})/(\d{2})/(\d{4})")
-OG_DESCRIPTION_RE = re.compile(
-    r'<meta[^>]*property=["\']og:description["\'][^>]*content=["\'](.*?)["\']\s*/?>',
-    re.S | re.I,
-)
 RADICADO_RE = re.compile(r"radicad[oa]\s*(?:no\.?|número)?\s*:?\s*([0-9][0-9\-\.]{8,30})", re.I)
 
 # Filtro: solo nos interesan avisos que mencionen remate o subasta
@@ -241,112 +220,6 @@ def extraer_campos(texto_descripcion, radicado_ya_extraido):
         "direccion": extraer_direccion(texto_descripcion),
         "secuestre": extraer_secuestre(texto_descripcion),
     }
-
-
-def generar_ids_avisos():
-    """Recorre las páginas del listado (ya viene ordenado por más recientes)
-    y va entregando los IDs de aviso uno por uno, sin duplicados. Al ser un
-    generador, si quien lo consume deja de pedir IDs (por ejemplo porque ya
-    completó los 20 resultados) no se siguen descargando páginas de más."""
-    ids_vistos = set()
-    for pagina in range(1, MAX_PAGINAS_EDICTOS + 1):
-        url_pagina = f"{BASE_URL_EDICTOS}?max_per_page=50&search_results_view=lineal&page={pagina}"
-        try:
-            html = descargar(url_pagina)
-        except Exception as e:
-            print(f"[Edictos] Error en página {pagina}: {e}")
-            break
-        encontrados = AVISO_URL_RE.findall(html)
-        if not encontrados:
-            break
-        for _id_categoria, id_aviso in encontrados:
-            if id_aviso not in ids_vistos:
-                ids_vistos.add(id_aviso)
-                yield id_aviso
-
-
-def parse_fecha_publicado(html):
-    m = FECHA_PUBLICADO_RE.search(html)
-    if not m:
-        return None
-    dia, mes, anio = m.groups()
-    try:
-        return datetime.date(int(anio), int(mes), int(dia))
-    except ValueError:
-        return None
-
-
-def extraer_descripcion(html):
-    # La meta og:description trae el texto completo del edicto (más
-    # confiable que intentar parsear el bloque visible de la página).
-    m = OG_DESCRIPTION_RE.search(html)
-    if m:
-        desc = m.group(1)
-        desc = desc.replace("&amp;", "&").replace("&quot;", '"').replace("&#039;", "'")
-        return re.sub(r"\s+", " ", desc).strip()
-
-    # Respaldo: extraer el bloque "Descripción" del cuerpo visible.
-    texto = html_a_texto(html)
-    m = re.search(r"Descripci[oó]n\s*\n+(.+?)(?:\n\s*Denunciar|\n\s*Avisos similares|$)", texto, re.S | re.I)
-    if m:
-        return re.sub(r"\s+", " ", m.group(1)).strip()
-    return "Descripción no disponible, revisa el aviso en el enlace."
-
-
-def recolectar_edictos():
-    hoy = datetime.date.today()
-    resultados = []
-    avisos_revisados = 0
-
-    for id_aviso in generar_ids_avisos():
-        if len(resultados) >= MAX_RESULTADOS:
-            print(f"[Edictos] Se completaron los {MAX_RESULTADOS} resultados solicitados.")
-            break
-        if avisos_revisados >= MAX_AVISOS_REVISADOS:
-            print(f"[Edictos] Se alcanzó el tope de avisos revisados ({MAX_AVISOS_REVISADOS}) sin llegar a {MAX_RESULTADOS} resultados.")
-            break
-
-        avisos_revisados += 1
-        # El id de categoría exacto no es necesario para acceder al aviso;
-        # el sitio redirige correctamente aunque se use un valor genérico.
-        url_detalle = f"https://www.masificados.com/otros/ocasional/0/aviso/{id_aviso}/"
-        try:
-            html = descargar(url_detalle)
-        except Exception as e:
-            print(f"[Edictos] Error abriendo aviso {id_aviso}: {e}")
-            continue
-
-        descripcion = extraer_descripcion(html)
-
-        # Filtro 1: debe mencionar remate o subasta.
-        if not MENCIONA_REMATE_RE.search(descripcion):
-            continue
-
-        # Filtro 2: debe tener una fecha de remate identificable y no vencida.
-        fecha_remate_obj, fecha_remate_texto = extraer_fecha_remate(descripcion)
-        if fecha_remate_obj is None or fecha_remate_obj < hoy:
-            continue
-
-        fecha_publicado = parse_fecha_publicado(html)
-        radicado_m = RADICADO_RE.search(descripcion)
-        radicado = radicado_m.group(1).strip(" .,") if radicado_m else None
-        campos = extraer_campos(descripcion, radicado)
-
-        aviso = {
-            "id": id_aviso,
-            "descripcion": descripcion,
-            "fecha_publicado_texto": fecha_publicado.strftime("%d/%m/%Y") if fecha_publicado else NO_ESPECIFICADO,
-            "fecha_remate": fecha_remate_texto,
-            "fecha_remate_obj": fecha_remate_obj,
-            "link": url_detalle,
-            "fuente": "Clasificados El Colombiano",
-        }
-        aviso.update(campos)
-        resultados.append(aviso)
-
-    print(f"[Edictos] {avisos_revisados} aviso(s) revisados, {len(resultados)} cumplen los filtros (remate/subasta + fecha futura)")
-    resultados.sort(key=lambda a: a["fecha_remate_obj"])
-    return resultados
 
 
 # =========================================================================
@@ -580,7 +453,7 @@ def construir_html(edictos):
                       ⚖️ Remates y subastas judiciales próximos
                     </div>
                     <div style="font-size:13px; color:#c9d6e5; margin-top:4px;">
-                      Clasificados Judiciales — El Colombiano · {hoy} · {len(edictos)} de hasta {MAX_RESULTADOS} resultado(s)
+                      Asuntos Legales (La República) · {hoy} · {len(edictos)} de hasta {MAX_RESULTADOS} resultado(s)
                     </div>
                   </td>
                 </tr>
@@ -594,11 +467,10 @@ def construir_html(edictos):
                 <tr>
                   <td style="padding:6px 22px 22px 22px;">
                     <p style="font-size:11px; color:#9ca3af; line-height:1.5; margin:0;">
-                      Fuentes: Clasificados Judiciales de El Colombiano y categoría REMATES del
-                      buscador de Edictos de Asuntos Legales (La República). Solo se incluyen
-                      avisos que mencionan remate o subasta y cuya fecha de remate detectada es
-                      igual o posterior a hoy ({hoy}), ordenados del más próximo al más lejano,
-                      hasta un máximo combinado de {MAX_RESULTADOS}. Los campos (avalúo, postura
+                      Fuente: categoría REMATES del buscador de Edictos de Asuntos Legales
+                      (La República). Solo se incluyen avisos que mencionan remate o subasta y
+                      cuya fecha de remate detectada es igual o posterior a hoy ({hoy}), ordenados
+                      del más próximo al más lejano, hasta un máximo de {MAX_RESULTADOS}. Los campos (avalúo, postura
                       mínima, fecha de remate, radicado, entidad, ubicación, dirección y
                       secuestre) se extraen automáticamente del texto del aviso mediante reglas
                       de texto, sin intervención de IA; cuando un dato no se logra identificar,
@@ -624,7 +496,7 @@ def enviar_correo(html: str, total: int):
         print("Faltan variables de correo (GMAIL_USER / GMAIL_APP_PASSWORD / RECIPIENT_EMAIL). No se envía correo.")
         return
 
-    asunto = f"Remates y subastas judiciales El Colombiano — {total} resultado(s) — {datetime.date.today().isoformat()}"
+    asunto = f"Remates y subastas judiciales (Asuntos Legales) — {total} resultado(s) — {datetime.date.today().isoformat()}"
     msg = MIMEMultipart("alternative")
     msg["Subject"] = asunto
     msg["From"] = GMAIL_USER
@@ -639,17 +511,10 @@ def enviar_correo(html: str, total: int):
 
 
 def main():
-    edictos_colombiano = recolectar_edictos()
-    edictos_asuntoslegales = recolectar_remates_asuntoslegales()
-
-    edictos = edictos_colombiano + edictos_asuntoslegales
-    edictos.sort(key=lambda a: a["fecha_remate_obj"])
+    edictos = recolectar_remates_asuntoslegales()
     edictos = edictos[:MAX_RESULTADOS]
 
-    print(
-        f"Remates/subastas encontrados: {len(edictos)} "
-        f"(El Colombiano: {len(edictos_colombiano)}, Asuntos Legales: {len(edictos_asuntoslegales)})"
-    )
+    print(f"Remates/subastas encontrados en Asuntos Legales: {len(edictos)}")
 
     html = construir_html(edictos)
     enviar_correo(html, len(edictos))
