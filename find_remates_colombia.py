@@ -1,17 +1,11 @@
-import time
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+from datetime import datetime
 import smtplib
 from email.message import EmailMessage
-from datetime import datetime
-
-from bs4 import BeautifulSoup
-
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
+import os
+import re
 
 
 # ============================================================
@@ -25,215 +19,450 @@ FECHA_FINAL = "08/09/2026"
 
 PALABRA_CLAVE = "remate"
 
-# Correo que recibirá el reporte
-CORREO_DESTINO = "TU_CORREO@gmail.com"
+# Correo destino
+EMAIL_DESTINO = os.environ["EMAIL_DESTINO"]
 
-# Correo desde el cual se enviará
-CORREO_REMITENTE = "TU_CORREO@gmail.com"
+# Correo desde el cual se envía
+EMAIL_REMITENTE = os.environ["EMAIL_REMITENTE"]
 
-# Para Gmail se recomienda utilizar una contraseña de aplicación
-CONTRASENA = "TU_CONTRASENA_DE_APLICACION"
-
-SMTP_SERVER = "smtp.gmail.com"
-SMTP_PORT = 587
-
-ARCHIVO_REPORTE = "resultados_remates.txt"
+# Contraseña de aplicación
+EMAIL_PASSWORD = os.environ["EMAIL_PASSWORD"]
 
 
 # ============================================================
-# CONFIGURAR CHROME
+# SESIÓN HTTP
 # ============================================================
 
-options = webdriver.ChromeOptions()
+session = requests.Session()
 
-# Si quieres ver el navegador, deja esto comentado.
-# Si quieres que funcione en segundo plano, descoméntalo.
-# options.add_argument("--headless=new")
+session.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 "
+        "(KHTML, like Gecko) "
+        "Chrome/131.0 Safari/537.36"
+    ),
+    "Accept-Language": "es-CO,es;q=0.9,en;q=0.8",
+})
 
-options.add_argument("--start-maximized")
 
-driver = webdriver.Chrome(
-    service=Service(ChromeDriverManager().install()),
-    options=options
+# ============================================================
+# OBTENER PÁGINA
+# ============================================================
+
+print("Abriendo página...")
+
+response = session.get(
+    URL,
+    timeout=30
 )
 
-wait = WebDriverWait(driver, 20)
+response.raise_for_status()
+
+print("Página cargada correctamente.")
+
+soup = BeautifulSoup(
+    response.text,
+    "html.parser"
+)
 
 
 # ============================================================
-# ABRIR PÁGINA
+# MOSTRAR FORMULARIOS
 # ============================================================
 
-print("Abriendo Avisos Judiciales...")
+print("\nFormularios encontrados:")
 
-driver.get(URL)
+for i, form in enumerate(soup.find_all("form")):
 
-time.sleep(3)
-
-
-# ============================================================
-# MOSTRAR ELEMENTOS PARA DEBUG
-# ============================================================
-
-print("Página cargada.")
-
-print("Título:", driver.title)
+    print(
+        i,
+        "action=",
+        form.get("action"),
+        "method=",
+        form.get("method")
+    )
 
 
 # ============================================================
-# BUSCAR INPUTS
+# BUSCAR FORMULARIO PRINCIPAL
 # ============================================================
 
-inputs = driver.find_elements(By.TAG_NAME, "input")
+form = None
 
-print("\nInputs encontrados:")
+for f in soup.find_all("form"):
 
-for i, elemento in enumerate(inputs):
-    try:
-        print(
-            i,
-            "type=", elemento.get_attribute("type"),
-            "name=", elemento.get_attribute("name"),
-            "id=", elemento.get_attribute("id"),
-            "placeholder=", elemento.get_attribute("placeholder")
-        )
-    except:
-        pass
+    texto = f.get_text(
+        " ",
+        strip=True
+    ).lower()
+
+    if (
+        "palabra" in texto
+        or "buscar" in texto
+        or "fecha" in texto
+    ):
+        form = f
+        break
+
+
+if form is None:
+
+    raise Exception(
+        "No se encontró el formulario de búsqueda."
+    )
+
+
+print("\nFormulario seleccionado.")
+
+
+# ============================================================
+# MOSTRAR INPUTS
+# ============================================================
+
+print("\nCampos encontrados:")
+
+for inp in form.find_all(
+    ["input", "select", "button"]
+):
+
+    print(
+        inp.name,
+        "name=",
+        inp.get("name"),
+        "id=",
+        inp.get("id"),
+        "type=",
+        inp.get("type"),
+        "value=",
+        inp.get("value")
+    )
+
+
+# ============================================================
+# OBTENER ACTION
+# ============================================================
+
+action = form.get("action")
+
+if not action:
+    action = URL
+
+endpoint = urljoin(
+    URL,
+    action
+)
+
+print("\nEndpoint:", endpoint)
+
+
+# ============================================================
+# CONSTRUIR DATOS DEL FORMULARIO
+# ============================================================
+
+data = {}
+
+for inp in form.find_all("input"):
+
+    name = inp.get("name")
+
+    if not name:
+        continue
+
+    input_type = (
+        inp.get("type") or "text"
+    ).lower()
+
+    value = inp.get("value", "")
+
+    if input_type in [
+        "submit",
+        "button",
+        "reset"
+    ]:
+        continue
+
+    data[name] = value
 
 
 # ============================================================
 # IDENTIFICAR CAMPOS
 # ============================================================
 
-# Buscamos el campo de palabra clave.
-# La página muestra un input para "Palabra clave".
+campo_palabra = None
+campo_inicio = None
+campo_fin = None
 
-campo_busqueda = None
 
-for elemento in inputs:
-
-    placeholder = (
-        elemento.get_attribute("placeholder") or ""
-    ).lower()
+for inp in form.find_all("input"):
 
     name = (
-        elemento.get_attribute("name") or ""
+        inp.get("name") or ""
     ).lower()
 
-    elemento_id = (
-        elemento.get_attribute("id") or ""
+    id_ = (
+        inp.get("id") or ""
     ).lower()
 
-    if (
-        "palabra" in placeholder
-        or "keyword" in name
-        or "buscar" in name
-        or "search" in elemento_id
-    ):
-        campo_busqueda = elemento
-        break
+    placeholder = (
+        inp.get("placeholder") or ""
+    ).lower()
 
-
-if campo_busqueda is None:
-
-    # Intento alternativo:
-    # buscar inputs de texto.
-
-    for elemento in inputs:
-
-        tipo = elemento.get_attribute("type")
-
-        if tipo == "text":
-            campo_busqueda = elemento
-            break
-
-
-if campo_busqueda is None:
-    driver.quit()
-    raise Exception(
-        "No se encontró el campo de búsqueda."
+    identificador = (
+        name + " " +
+        id_ + " " +
+        placeholder
     )
 
+    # Palabra clave
+    if (
+        "palabra" in identificador
+        or "keyword" in identificador
+        or "buscar" in identificador
+        or "search" in identificador
+    ):
+        campo_palabra = inp.get("name")
 
-# ============================================================
-# ESCRIBIR "REMATE"
-# ============================================================
+    # Fecha inicial
+    if (
+        "inicio" in identificador
+        or "desde" in identificador
+        or "start" in identificador
+    ):
+        campo_inicio = inp.get("name")
 
-print("Escribiendo palabra clave:", PALABRA_CLAVE)
-
-campo_busqueda.click()
-
-campo_busqueda.clear()
-
-campo_busqueda.send_keys(PALABRA_CLAVE)
-
-
-# ============================================================
-# PRESIONAR ENTER
-# ============================================================
-
-print("Presionando ENTER...")
-
-campo_busqueda.send_keys(Keys.ENTER)
-
-time.sleep(5)
-
-
-# ============================================================
-# OBTENER RESULTADOS
-# ============================================================
-
-print("\nResultados cargados.")
-
-html = driver.page_source
-
-soup = BeautifulSoup(html, "html.parser")
+    # Fecha final
+    if (
+        "fin" in identificador
+        or "hasta" in identificador
+        or "end" in identificador
+    ):
+        campo_fin = inp.get("name")
 
 
-# ============================================================
-# EXTRAER TEXTO DE RESULTADOS
-# ============================================================
+print("\nCampos identificados:")
 
-texto_pagina = soup.get_text(
-    "\n",
-    strip=True
+print(
+    "Palabra:",
+    campo_palabra
+)
+
+print(
+    "Fecha inicio:",
+    campo_inicio
+)
+
+print(
+    "Fecha fin:",
+    campo_fin
 )
 
 
-# Guardamos todo el texto visible
-with open(
-    ARCHIVO_REPORTE,
-    "w",
-    encoding="utf-8"
-) as archivo:
+# ============================================================
+# SI NO SE IDENTIFICAN AUTOMÁTICAMENTE
+# MOSTRAR ERROR PARA AJUSTAR
+# ============================================================
 
-    archivo.write(
-        "RESULTADOS AVISOS JUDICIALES\n"
+if campo_palabra is None:
+
+    raise Exception(
+        "No se pudo identificar el campo de palabra clave."
     )
 
-    archivo.write(
-        "====================================\n\n"
+if campo_inicio is None:
+
+    raise Exception(
+        "No se pudo identificar el campo de fecha inicial."
     )
 
-    archivo.write(
-        f"Fecha inicial: {FECHA_INICIAL}\n"
+if campo_fin is None:
+
+    raise Exception(
+        "No se pudo identificar el campo de fecha final."
     )
 
-    archivo.write(
-        f"Fecha final: {FECHA_FINAL}\n"
+
+# ============================================================
+# COLOCAR VALORES
+# ============================================================
+
+data[campo_palabra] = PALABRA_CLAVE
+
+data[campo_inicio] = FECHA_INICIAL
+
+data[campo_fin] = FECHA_FINAL
+
+
+print("\nDatos de búsqueda:")
+
+print(
+    f"Fecha inicial: {FECHA_INICIAL}"
+)
+
+print(
+    f"Fecha final: {FECHA_FINAL}"
+)
+
+print(
+    f"Palabra clave: {PALABRA_CLAVE}"
+)
+
+
+# ============================================================
+# EJECUTAR BÚSQUEDA
+# ============================================================
+
+print("\nEjecutando búsqueda...")
+
+
+method = (
+    form.get("method") or "GET"
+).upper()
+
+
+if method == "POST":
+
+    resultado = session.post(
+        endpoint,
+        data=data,
+        timeout=30
     )
 
-    archivo.write(
-        f"Palabra clave: {PALABRA_CLAVE}\n\n"
+else:
+
+    resultado = session.get(
+        endpoint,
+        params=data,
+        timeout=30
     )
 
-    archivo.write(
-        "====================================\n\n"
+
+resultado.raise_for_status()
+
+
+print(
+    "Búsqueda ejecutada:",
+    resultado.url
+)
+
+
+# ============================================================
+# PROCESAR RESULTADOS
+# ============================================================
+
+resultado_soup = BeautifulSoup(
+    resultado.text,
+    "html.parser"
+)
+
+
+# ============================================================
+# EXTRAER RESULTADOS
+# ============================================================
+
+resultados = []
+
+
+# Buscar enlaces a detalle
+for enlace in resultado_soup.find_all(
+    "a",
+    href=True
+):
+
+    href = enlace.get("href")
+
+    texto = enlace.get_text(
+        " ",
+        strip=True
     )
 
-    archivo.write(
-        texto_pagina
+    if not texto:
+        continue
+
+    if (
+        "detalle.php" in href.lower()
+        or "detalle" in href.lower()
+    ):
+
+        url_detalle = urljoin(
+            endpoint,
+            href
+        )
+
+        resultados.append({
+            "titulo": texto,
+            "url": url_detalle
+        })
+
+
+# Eliminar duplicados
+unicos = {}
+
+for resultado_item in resultados:
+
+    unicos[
+        resultado_item["url"]
+    ] = resultado_item
+
+
+resultados = list(
+    unicos.values()
+)
+
+
+print(
+    f"\nResultados encontrados: {len(resultados)}"
+)
+
+
+# ============================================================
+# OBTENER CONTENIDO DE CADA RESULTADO
+# ============================================================
+
+resultados_completos = []
+
+
+for numero, item in enumerate(
+    resultados,
+    start=1
+):
+
+    print(
+        f"Procesando {numero}/{len(resultados)}..."
     )
+
+    try:
+
+        detalle = session.get(
+            item["url"],
+            timeout=30
+        )
+
+        detalle.raise_for_status()
+
+        detalle_soup = BeautifulSoup(
+            detalle.text,
+            "html.parser"
+        )
+
+        texto = detalle_soup.get_text(
+            "\n",
+            strip=True
+        )
+
+        resultados_completos.append({
+            "titulo": item["titulo"],
+            "url": item["url"],
+            "texto": texto
+        })
+
+    except Exception as error:
+
+        print(
+            "Error:",
+            item["url"],
+            error
+        )
 
 
 # ============================================================
@@ -241,43 +470,146 @@ with open(
 # ============================================================
 
 print("\n")
-print("=" * 70)
-print("RESULTADOS")
-print("=" * 70)
+print("=" * 80)
+print("RESULTADOS DE REMATES")
+print("=" * 80)
 
-print(texto_pagina)
+for i, item in enumerate(
+    resultados_completos,
+    start=1
+):
 
-print("=" * 70)
+    print("\n")
+    print("=" * 80)
+
+    print(
+        f"RESULTADO #{i}"
+    )
+
+    print("=" * 80)
+
+    print(
+        "Título:",
+        item["titulo"]
+    )
+
+    print(
+        "URL:",
+        item["url"]
+    )
+
+    print("\n")
+
+    print(
+        item["texto"]
+    )
+
+
+# ============================================================
+# GENERAR REPORTE
+# ============================================================
+
+archivo = "resultados_remates.txt"
+
+
+with open(
+    archivo,
+    "w",
+    encoding="utf-8"
+) as f:
+
+    f.write(
+        "REPORTE DE AVISOS JUDICIALES\n"
+    )
+
+    f.write(
+        "=" * 80 + "\n\n"
+    )
+
+    f.write(
+        f"Fecha inicial: {FECHA_INICIAL}\n"
+    )
+
+    f.write(
+        f"Fecha final: {FECHA_FINAL}\n"
+    )
+
+    f.write(
+        f"Palabra clave: {PALABRA_CLAVE}\n"
+    )
+
+    f.write(
+        f"Total resultados: "
+        f"{len(resultados_completos)}\n\n"
+    )
+
+    f.write(
+        "=" * 80 + "\n"
+    )
+
+    for i, item in enumerate(
+        resultados_completos,
+        start=1
+    ):
+
+        f.write(
+            f"\nRESULTADO #{i}\n"
+        )
+
+        f.write(
+            "-" * 80 + "\n"
+        )
+
+        f.write(
+            f"Título: {item['titulo']}\n"
+        )
+
+        f.write(
+            f"URL: {item['url']}\n\n"
+        )
+
+        f.write(
+            item["texto"]
+        )
+
+        f.write(
+            "\n\n"
+        )
+
+
+print(
+    f"\nReporte generado: {archivo}"
+)
 
 
 # ============================================================
 # ENVIAR CORREO
 # ============================================================
 
-print("\nEnviando reporte por correo...")
+print("\nEnviando correo...")
 
 
 mensaje = EmailMessage()
 
 mensaje["Subject"] = (
-    f"Avisos judiciales - {PALABRA_CLAVE} "
-    f"{FECHA_INICIAL} al {FECHA_FINAL}"
+    f"Remates Colombia | "
+    f"{FECHA_INICIAL} - {FECHA_FINAL}"
 )
 
-mensaje["From"] = CORREO_REMITENTE
+mensaje["From"] = EMAIL_REMITENTE
 
-mensaje["To"] = CORREO_DESTINO
+mensaje["To"] = EMAIL_DESTINO
 
 
 mensaje.set_content(
     f"""
-Resultado de búsqueda de Avisos Judiciales.
+Se encontraron {len(resultados_completos)}
+avisos judiciales relacionados con "{PALABRA_CLAVE}".
 
-Palabra clave:
-{PALABRA_CLAVE}
+Rango consultado:
 
-Rango:
-{FECHA_INICIAL} - {FECHA_FINAL}
+Desde: {FECHA_INICIAL}
+Hasta: {FECHA_FINAL}
 
 El reporte completo se encuentra
 adjunto en este correo.
@@ -285,59 +617,42 @@ adjunto en este correo.
 )
 
 
-# Adjuntar reporte
-
 with open(
-    ARCHIVO_REPORTE,
+    archivo,
     "rb"
-) as archivo:
-
-    datos = archivo.read()
+) as f:
 
     mensaje.add_attachment(
-        datos,
+        f.read(),
         maintype="text",
         subtype="plain",
-        filename=ARCHIVO_REPORTE
+        filename=archivo
     )
 
 
 # ============================================================
-# CONEXIÓN SMTP
+# SMTP GMAIL
 # ============================================================
 
-try:
+with smtplib.SMTP(
+    "smtp.gmail.com",
+    587
+) as servidor:
 
-    with smtplib.SMTP(
-        SMTP_SERVER,
-        SMTP_PORT
-    ) as servidor:
+    servidor.starttls()
 
-        servidor.starttls()
+    servidor.login(
+        EMAIL_REMITENTE,
+        EMAIL_PASSWORD
+    )
 
-        servidor.login(
-            CORREO_REMITENTE,
-            CONTRASENA
-        )
-
-        servidor.send_message(
-            mensaje
-        )
-
-    print("Correo enviado correctamente.")
-
-except Exception as error:
-
-    print(
-        "Error enviando correo:",
-        error
+    servidor.send_message(
+        mensaje
     )
 
 
-# ============================================================
-# FINALIZAR
-# ============================================================
+print(
+    "Correo enviado correctamente."
+)
 
 print("\nProceso terminado.")
-
-driver.quit()
