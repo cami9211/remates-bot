@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-monitor_remate.py
-------------------
+find_remates_colombia.py
+--------------------------
 Versión SIN Selenium (solo `requests` + `BeautifulSoup`) pensada para
 correr en GitHub Actions como tarea diaria programada.
 
@@ -9,33 +9,22 @@ LÉEME - MUY IMPORTANTE:
 Este script asume que el formulario de "Otras consultas" del portal
 https://publicacionesprocesales.ramajudicial.gov.co puede enviarse como
 una petición HTTP normal (GET o POST) sin necesitar que un navegador
-ejecute JavaScript. Muchos portales Liferay funcionan así por debajo
-(el JS solo mejora la experiencia visual), pero esto NO se pudo verificar
-en el entorno donde se generó este script, porque no tiene acceso a
-internet.
+ejecute JavaScript. Esto NO se ha podido verificar en el entorno donde
+se generó este script (sin acceso a internet).
 
 CÓMO CONFIRMARLO Y AJUSTAR ESTE SCRIPT (hazlo una sola vez, tú mismo):
   1. Abre el portal en Chrome: la URL de arriba.
   2. Pulsa F12 -> pestaña "Network" (Red) -> marca "Preserve log".
   3. Selecciona los filtros (Departamento, Despacho, Mes, Año) y haz clic
      en "Consultar".
-  4. Busca en la lista de peticiones la que trae los resultados (normalmente
-     un XHR/Fetch, o el propio documento HTML si recarga la página).
-  5. Haz clic derecho sobre esa petición -> "Copy" -> "Copy as cURL".
-  6. Pégame ese cURL (o el Request URL + Form Data / Payload que veas en
-     la pestaña "Headers") y te ajusto los valores de FORM_DATA y
-     SEARCH_URL de abajo para que coincidan exactamente.
+  4. Busca la petición que trae los resultados (XHR/Fetch, o el propio
+     documento HTML si recarga la página).
+  5. Clic derecho sobre esa petición -> "Copy" -> "Copy as cURL".
+  6. Pégame ese cURL y te ajusto SEARCH_URL / FORM_DATA_TEMPLATE.
 
-Si la petición que trae los resultados es un XHR que devuelve JSON o HTML
-parcial, este script funcionará prácticamente igual, solo cambiando la
-URL y el payload. Si en cambio los resultados solo se generan corriendo
-JavaScript en el navegador (SPA real), este enfoque sin Selenium
-lamentablemente NO es viable y tocaría usar el otro script con Selenium
-en un runner que sí soporte navegador (GitHub Actions también puede
-correr Selenium con `browser-actions/setup-chrome`, si prefieres esa vía).
-
-DEPENDENCIAS (ver requirements.txt):
-    pip install requests beautifulsoup4
+Si los resultados solo se generan ejecutando JavaScript en el navegador
+(SPA real), este enfoque sin navegador no es viable y tocaría volver a
+la versión con Selenium.
 """
 
 import os
@@ -45,7 +34,7 @@ import sys
 from datetime import datetime
 from email.mime.text import MIMEText
 
-
+import requests
 from bs4 import BeautifulSoup
 
 # ---------------------------------------------------------------------------
@@ -55,17 +44,13 @@ from bs4 import BeautifulSoup
 BASE_URL = "https://publicacionesprocesales.ramajudicial.gov.co"
 SEARCH_PAGE_URL = f"{BASE_URL}/web/publicaciones-procesales/otras-consultas"
 
-# PLACEHOLDER: reemplaza esta URL por la que veas en DevTools como
-# destino real del formulario (puede ser la misma SEARCH_PAGE_URL con
-# parámetros, o una URL de portlet tipo
-# ".../otras-consultas?p_p_id=...&p_p_lifecycle=2&...")
+# PLACEHOLDER: reemplaza por la URL real de destino del formulario que
+# veas en DevTools (puede llevar parámetros p_p_id, p_p_lifecycle, etc.)
 SEARCH_URL = SEARCH_PAGE_URL
 
-# PLACEHOLDER: estos son los nombres de campo típicos, pero Liferay suele
-# usar nombres largos con namespace de portlet, algo como:
-# "_com_liferay_..._departamento" en vez de simplemente "departamento".
-# Reemplaza las CLAVES (a la izquierda de los ":") por los nombres reales
-# que veas en la pestaña "Payload"/"Form Data" de DevTools.
+# PLACEHOLDER: reemplaza las CLAVES por los nombres reales de campo que
+# veas en la pestaña "Payload"/"Form Data" de DevTools (Liferay suele usar
+# nombres largos con namespace de portlet).
 FORM_DATA_TEMPLATE = {
     "departamento": "ANTIOQUIA",
     "despacho": "050013403000",   # Oficina de Apoyo Juzgados Civiles Circuito Ejecución Medellín
@@ -91,7 +76,7 @@ HEADERS = {
 }
 
 # ---------------------------------------------------------------------------
-# CONFIGURACIÓN DE CORREO (usa GitHub Secrets, ver workflow .yml adjunto)
+# CONFIGURACIÓN DE CORREO (viene de GitHub Secrets, ver workflow .yml)
 # ---------------------------------------------------------------------------
 
 EMAIL_REMITENTE = os.environ.get("REMATE_BOT_EMAIL", "")
@@ -123,13 +108,10 @@ def consultar_portal():
     session.headers.update(HEADERS)
 
     # Paso 1: cargar la página para obtener cookies de sesión / tokens
-    # (algunos portales Liferay requieren un token CSRF que viaja como
-    # input oculto en el HTML; si es el caso, habrá que extraerlo aquí
-    # con BeautifulSoup antes del POST).
     resp_inicial = session.get(SEARCH_PAGE_URL, timeout=30)
     resp_inicial.raise_for_status()
 
-    # Si el portal requiere un token oculto, descomenta y ajusta esto:
+    # Si el portal requiere un token oculto (CSRF), descomenta y ajusta:
     # sopa_inicial = BeautifulSoup(resp_inicial.text, "html.parser")
     # token = sopa_inicial.find("input", {"name": "p_auth"})
     # if token:
@@ -137,8 +119,8 @@ def consultar_portal():
 
     form_data = construir_form_data()
 
-    # Paso 2: enviar la consulta. Prueba primero con POST; si no funciona,
-    # intenta cambiar a session.get(SEARCH_URL, params=form_data, ...)
+    # Paso 2: enviar la consulta. Si POST no funciona, prueba GET:
+    # resp = session.get(SEARCH_URL, params=form_data, timeout=30)
     resp = session.post(SEARCH_URL, data=form_data, timeout=30)
     resp.raise_for_status()
 
@@ -203,10 +185,10 @@ def main():
             f"La consulta automática falló el {fecha}.\n\n"
             f"Detalle del error:\n{exc}\n\n"
             "Causa más probable: el formulario del portal necesita "
-            "JavaScript para mostrar resultados y una petición HTTP simple "
-            "no basta, o cambiaron los nombres de los campos del formulario. "
-            "Revisa las instrucciones del encabezado del script (inspección "
-            "con DevTools) para ajustar SEARCH_URL y FORM_DATA_TEMPLATE."
+            "JavaScript para mostrar resultados, o cambiaron los nombres "
+            "de los campos del formulario. Revisa las instrucciones del "
+            "encabezado del script (inspección con DevTools) para ajustar "
+            "SEARCH_URL y FORM_DATA_TEMPLATE."
         )
         print(cuerpo)
         enviar_correo(asunto, cuerpo)
