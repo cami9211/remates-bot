@@ -90,7 +90,7 @@ def obtener_formulario(session):
 
     respuesta = session.get(
         URL,
-        timeout=30
+        timeout=90
     )
 
     respuesta.raise_for_status()
@@ -187,13 +187,13 @@ def ejecutar_busqueda(session, action, method, datos):
         respuesta = session.post(
             action,
             data=datos,
-            timeout=30
+            timeout=90
         )
     else:
         respuesta = session.get(
             action,
             params=datos,
-            timeout=30
+            timeout=90
         )
 
     respuesta.raise_for_status()
@@ -334,7 +334,7 @@ def obtener_detalle(session, resultado):
     try:
         respuesta = session.get(
             url_detalle,
-            timeout=30
+            timeout=90
         )
 
         respuesta.raise_for_status()
@@ -481,7 +481,7 @@ def buscar_todas_las_paginas(
             else:
                 respuesta = session.get(
                     url_actual,
-                    timeout=30
+                    timeout=90
                 )
 
             respuesta.raise_for_status()
@@ -646,7 +646,7 @@ El reporte completo se encuentra adjunto.
     with smtplib.SMTP(
         "smtp.gmail.com",
         587,
-        timeout=30
+        timeout=90
     ) as servidor:
 
         servidor.ehlo()
