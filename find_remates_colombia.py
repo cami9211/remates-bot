@@ -2,29 +2,35 @@
 """
 find_remates_colombia.py
 --------------------------
-Versión SIN Selenium (solo `requests` + `BeautifulSoup`) pensada para
-correr en GitHub Actions como tarea diaria programada.
+Fuente: Avisos Judiciales de El Espectador (judiciales.elespectador.com),
+un sitio PHP clásico (no requiere JavaScript para mostrar resultados,
+a diferencia del portal de la Rama Judicial).
 
 LÉEME - MUY IMPORTANTE:
-Este script asume que el formulario de "Otras consultas" del portal
-https://publicacionesprocesales.ramajudicial.gov.co puede enviarse como
-una petición HTTP normal (GET o POST) sin necesitar que un navegador
-ejecute JavaScript. Esto NO se ha podido verificar en el entorno donde
-se generó este script (sin acceso a internet).
+Este sitio bloquea el acceso automatizado en su robots.txt, así que no
+se pudo inspeccionar su formulario de búsqueda desde el entorno donde
+se generó este script (sin acceso a internet y respetando ese bloqueo).
+Los nombres de parámetros de abajo (SEARCH_PARAMS_TEMPLATE) son
+PLACEHOLDERS - tienes que confirmarlos tú mismo:
 
-CÓMO CONFIRMARLO Y AJUSTAR ESTE SCRIPT (hazlo una sola vez, tú mismo):
-  1. Abre el portal en Chrome: la URL de arriba.
-  2. Pulsa F12 -> pestaña "Network" (Red) -> marca "Preserve log".
-  3. Selecciona los filtros (Departamento, Despacho, Mes, Año) y haz clic
-     en "Consultar".
-  4. Busca la petición que trae los resultados (XHR/Fetch, o el propio
-     documento HTML si recarga la página).
-  5. Clic derecho sobre esa petición -> "Copy" -> "Copy as cURL".
-  6. Pégame ese cURL y te ajusto SEARCH_URL / FORM_DATA_TEMPLATE.
+  1. Ve a https://judiciales.elespectador.com/ en tu navegador.
+  2. Configura el rango de fechas y escribe "remate", dale a "Buscar".
+  3. Mira la URL resultante en la barra de direcciones. Si cambió a algo
+     como ".../resultados.php?buscar=remate&fecha_ini=2026-08-10&fecha_fin=2026-09-08",
+     esos son los nombres reales de los parámetros - reemplázalos abajo.
+  4. Si la URL no cambia (el formulario usa POST), abre F12 -> Network,
+     repite la búsqueda, clic derecho sobre la petición que trae los
+     resultados -> "Copy" -> "Copy as cURL", y pégamela para que te
+     ajuste el script con los valores exactos.
 
-Si los resultados solo se generan ejecutando JavaScript en el navegador
-(SPA real), este enfoque sin navegador no es viable y tocaría volver a
-la versión con Selenium.
+IMPORTANTE - USO RESPONSABLE: este sitio pide explícitamente en su
+robots.txt que no se acceda de forma automatizada. Este script consulta
+contenido público (avisos judiciales, de interés general y sin
+restricción de acceso para lectura humana normal), pero de todas formas
+conviene: (a) NO aumentar la frecuencia más allá de 1 vez al día, (b)
+revisar los Términos de Uso del sitio antes de dejarlo corriendo de
+forma permanente, y (c) estar dispuesto a detenerlo si el sitio empieza
+a bloquear la IP del runner de GitHub Actions.
 """
 
 import os
@@ -38,33 +44,36 @@ import requests
 from bs4 import BeautifulSoup
 
 # ---------------------------------------------------------------------------
-# CONFIGURACIÓN - AJUSTA ESTOS VALORES DESPUÉS DE INSPECCIONAR LA PETICIÓN REAL
+# CONFIGURACIÓN - AJUSTA ESTOS VALORES DESPUÉS DE INSPECCIONAR LA BÚSQUEDA REAL
 # ---------------------------------------------------------------------------
 
-BASE_URL = "https://publicacionesprocesales.ramajudicial.gov.co"
-SEARCH_PAGE_URL = f"{BASE_URL}/web/publicaciones-procesales/otras-consultas"
+BASE_URL = "https://judiciales.elespectador.com"
+SEARCH_PAGE_URL = f"{BASE_URL}/"
 
-# PLACEHOLDER: reemplaza por la URL real de destino del formulario que
-# veas en DevTools (puede llevar parámetros p_p_id, p_p_lifecycle, etc.)
-SEARCH_URL = SEARCH_PAGE_URL
+# PLACEHOLDER: reemplaza por la URL real a la que apunta el formulario de
+# búsqueda cuando das clic en "Buscar" (revisa la barra de direcciones o
+# la pestaña Network de DevTools). Puede ser distinta a la página inicial,
+# p. ej. algo como f"{BASE_URL}/resultados.php".
+SEARCH_URL = f"{BASE_URL}/resultados.php"
 
-# PLACEHOLDER: reemplaza las CLAVES por los nombres reales de campo que
-# veas en la pestaña "Payload"/"Form Data" de DevTools (Liferay suele usar
-# nombres largos con namespace de portlet).
-FORM_DATA_TEMPLATE = {
-    "departamento": "ANTIOQUIA",
-    "despacho": "050013403000",   # Oficina de Apoyo Juzgados Civiles Circuito Ejecución Medellín
-    "mes": None,   # se rellena en tiempo de ejecución con el mes actual
-    "anio": None,  # se rellena en tiempo de ejecución con el año actual
+# Rango de días hacia atrás que se consulta cada vez que corre el script
+# (equivalente al selector de fechas de la captura: "Aug 10,26 - Sep 8,26").
+# Ajusta este número según qué tan seguido quieras revisar hacia atrás.
+DIAS_HACIA_ATRAS = 30
+
+# PLACEHOLDER: reemplaza las CLAVES por los nombres reales de parámetro
+# que veas en la URL o en el payload del formulario. Los nombres de abajo
+# (buscar, fecha_ini, fecha_fin) son una suposición razonable, no confirmada.
+SEARCH_PARAMS_TEMPLATE = {
+    "buscar": "remate",
+    "fecha_ini": None,  # se rellena en tiempo de ejecución
+    "fecha_fin": None,  # se rellena en tiempo de ejecución
 }
+FORMATO_FECHA = "%Y-%m-%d"  # ajusta si el sitio espera otro formato (ej. %d/%m/%Y)
 
-MESES_NUM_A_TEXTO = {
-    1: "01. Enero", 2: "02. Febrero", 3: "03. Marzo", 4: "04. Abril",
-    5: "05. Mayo", 6: "06. Junio", 7: "07. Julio", 8: "08. Agosto",
-    9: "09. Septiembre", 10: "10. Octubre", 11: "11. Noviembre", 12: "12. Diciembre",
-}
-
-# Palabras clave que buscamos en el HTML/JSON de resultados
+# Dirección del inmueble/proceso que te interesa resaltar dentro del
+# listado general de remates (no filtra la búsqueda, solo resalta el
+# resultado en el correo si aparece)
 PALABRAS_CLAVE = ["850221", "CALLE 5 SUR", "22-290"]
 
 HEADERS = {
