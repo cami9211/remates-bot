@@ -1,15 +1,15 @@
-import requests
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin
-from datetime import datetime
-import smtplib
-from email.message import EmailMessage
 import os
 import re
+import smtplib
+import requests
+
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+from email.message import EmailMessage
 
 
 # ============================================================
-# CONFIGURACIÓN
+# CONFIGURACIÓN DE LA BÚSQUEDA
 # ============================================================
 
 URL = "https://judiciales.elespectador.com/"
@@ -19,18 +19,69 @@ FECHA_FINAL = "08/09/2026"
 
 PALABRA_CLAVE = "remate"
 
-# Correo destino
-EMAIL_DESTINO = os.environ["EMAIL_DESTINO"]
 
-# Correo desde el cual se envía
-EMAIL_REMITENTE = os.environ["EMAIL_REMITENTE"]
+# ============================================================
+# VARIABLES DE GITHUB
+# ============================================================
+# Se obtienen desde GitHub Actions.
+#
+# El script intenta utilizar:
+#
+# EMAIL_DESTINO
+# EMAIL_REMITENTE
+# EMAIL_PASSWORD
+#
+# También acepta:
+#
+# EMAIL_TO
+# EMAIL_FROM
+# EMAIL_PASS
+#
+# para evitar problemas si tus Secrets tienen esos nombres.
+# ============================================================
 
-# Contraseña de aplicación
-EMAIL_PASSWORD = os.environ["EMAIL_PASSWORD"]
+EMAIL_DESTINO = (
+    os.getenv("EMAIL_DESTINO")
+    or os.getenv("EMAIL_TO")
+)
+
+EMAIL_REMITENTE = (
+    os.getenv("EMAIL_REMITENTE")
+    or os.getenv("EMAIL_FROM")
+)
+
+EMAIL_PASSWORD = (
+    os.getenv("EMAIL_PASSWORD")
+    or os.getenv("EMAIL_PASS")
+)
 
 
 # ============================================================
-# SESIÓN HTTP
+# VALIDAR VARIABLES
+# ============================================================
+
+faltantes = []
+
+if not EMAIL_DESTINO:
+    faltantes.append("EMAIL_DESTINO")
+
+if not EMAIL_REMITENTE:
+    faltantes.append("EMAIL_REMITENTE")
+
+if not EMAIL_PASSWORD:
+    faltantes.append("EMAIL_PASSWORD")
+
+
+if faltantes:
+
+    raise RuntimeError(
+        "Faltan variables de entorno en GitHub Actions: "
+        + ", ".join(faltantes)
+    )
+
+
+# ============================================================
+# CONFIGURAR SESIÓN HTTP
 # ============================================================
 
 session = requests.Session()
@@ -42,15 +93,223 @@ session.headers.update({
         "(KHTML, like Gecko) "
         "Chrome/131.0 Safari/537.36"
     ),
-    "Accept-Language": "es-CO,es;q=0.9,en;q=0.8",
+
+    "Accept": (
+        "text/html,application/xhtml+xml,"
+        "application/xml;q=0.9,image/avif,"
+        "image/webp,*/*;q=0.8"
+    ),
+
+    "Accept-Language": "es-CO,es;q=0.9",
+
+    "Connection": "keep-alive"
 })
+
+
+# ============================================================
+# FUNCIÓN PARA MOSTRAR INPUTS
+# ============================================================
+
+def mostrar_formulario(soup):
+
+    print("\n" + "=" * 80)
+    print("FORMULARIOS ENCONTRADOS")
+    print("=" * 80)
+
+    formularios = soup.find_all("form")
+
+    for numero, form in enumerate(formularios):
+
+        print(
+            f"\nFormulario #{numero}"
+        )
+
+        print(
+            "Action:",
+            form.get("action")
+        )
+
+        print(
+            "Method:",
+            form.get("method")
+        )
+
+        for elemento in form.find_all(
+            ["input", "select", "button"]
+        ):
+
+            print(
+                elemento.name,
+                "| name=",
+                elemento.get("name"),
+                "| id=",
+                elemento.get("id"),
+                "| type=",
+                elemento.get("type"),
+                "| value=",
+                elemento.get("value"),
+                "| placeholder=",
+                elemento.get("placeholder")
+            )
+
+
+# ============================================================
+# FUNCIÓN PARA IDENTIFICAR EL FORMULARIO
+# ============================================================
+
+def encontrar_formulario(soup):
+
+    formularios = soup.find_all("form")
+
+    for form in formularios:
+
+        texto = form.get_text(
+            " ",
+            strip=True
+        ).lower()
+
+        if (
+            "palabra clave" in texto
+            or "palabra" in texto
+            or "fecha inicio" in texto
+            or "fecha fin" in texto
+            or "buscar" in texto
+        ):
+
+            return form
+
+    return None
+
+
+# ============================================================
+# FUNCIÓN PARA IDENTIFICAR CAMPOS
+# ============================================================
+
+def identificar_campos(form):
+
+    campo_palabra = None
+    campo_inicio = None
+    campo_fin = None
+
+    elementos = form.find_all(
+        ["input", "select"]
+    )
+
+    for elemento in elementos:
+
+        name = (
+            elemento.get("name")
+            or ""
+        ).lower()
+
+        id_ = (
+            elemento.get("id")
+            or ""
+        ).lower()
+
+        placeholder = (
+            elemento.get("placeholder")
+            or ""
+        ).lower()
+
+        aria = (
+            elemento.get("aria-label")
+            or ""
+        ).lower()
+
+        texto = (
+            name
+            + " "
+            + id_
+            + " "
+            + placeholder
+            + " "
+            + aria
+        )
+
+        # ----------------------------------------
+        # PALABRA CLAVE
+        # ----------------------------------------
+
+        if (
+            "palabra" in texto
+            or "keyword" in texto
+            or "search" in texto
+            or "busqueda" in texto
+            or "búsqueda" in texto
+        ):
+
+            if not campo_palabra:
+                campo_palabra = elemento.get("name")
+
+
+        # ----------------------------------------
+        # FECHA INICIAL
+        # ----------------------------------------
+
+        if (
+            "fecha_inicio" in texto
+            or "fecha-inicio" in texto
+            or "fechainicio" in texto
+            or "inicio" in texto
+            or "desde" in texto
+            or "start" in texto
+        ):
+
+            if not campo_inicio:
+                campo_inicio = elemento.get("name")
+
+
+        # ----------------------------------------
+        # FECHA FINAL
+        # ----------------------------------------
+
+        if (
+            "fecha_fin" in texto
+            or "fecha-fin" in texto
+            or "fechafin" in texto
+            or "fin" in texto
+            or "hasta" in texto
+            or "end" in texto
+        ):
+
+            if not campo_fin:
+                campo_fin = elemento.get("name")
+
+
+    return (
+        campo_palabra,
+        campo_inicio,
+        campo_fin
+    )
 
 
 # ============================================================
 # OBTENER PÁGINA
 # ============================================================
 
-print("Abriendo página...")
+print("\n")
+print("=" * 80)
+print("AVISOS JUDICIALES - BÚSQUEDA DE REMATES")
+print("=" * 80)
+
+print(
+    f"\nFecha inicial : {FECHA_INICIAL}"
+)
+
+print(
+    f"Fecha final   : {FECHA_FINAL}"
+)
+
+print(
+    f"Palabra clave : {PALABRA_CLAVE}"
+)
+
+print(
+    "\nAbriendo:",
+    URL
+)
+
 
 response = session.get(
     URL,
@@ -59,7 +318,15 @@ response = session.get(
 
 response.raise_for_status()
 
-print("Página cargada correctamente.")
+
+print(
+    "Página cargada correctamente."
+)
+
+
+# ============================================================
+# ANALIZAR HTML
+# ============================================================
 
 soup = BeautifulSoup(
     response.text,
@@ -68,243 +335,200 @@ soup = BeautifulSoup(
 
 
 # ============================================================
-# MOSTRAR FORMULARIOS
+# ENCONTRAR FORMULARIO
 # ============================================================
 
-print("\nFormularios encontrados:")
-
-for i, form in enumerate(soup.find_all("form")):
-
-    print(
-        i,
-        "action=",
-        form.get("action"),
-        "method=",
-        form.get("method")
-    )
-
-
-# ============================================================
-# BUSCAR FORMULARIO PRINCIPAL
-# ============================================================
-
-form = None
-
-for f in soup.find_all("form"):
-
-    texto = f.get_text(
-        " ",
-        strip=True
-    ).lower()
-
-    if (
-        "palabra" in texto
-        or "buscar" in texto
-        or "fecha" in texto
-    ):
-        form = f
-        break
+form = encontrar_formulario(
+    soup
+)
 
 
 if form is None:
 
-    raise Exception(
-        "No se encontró el formulario de búsqueda."
+    mostrar_formulario(
+        soup
+    )
+
+    raise RuntimeError(
+        "No fue posible identificar "
+        "el formulario de búsqueda."
     )
 
 
-print("\nFormulario seleccionado.")
-
-
-# ============================================================
-# MOSTRAR INPUTS
-# ============================================================
-
-print("\nCampos encontrados:")
-
-for inp in form.find_all(
-    ["input", "select", "button"]
-):
-
-    print(
-        inp.name,
-        "name=",
-        inp.get("name"),
-        "id=",
-        inp.get("id"),
-        "type=",
-        inp.get("type"),
-        "value=",
-        inp.get("value")
-    )
-
-
-# ============================================================
-# OBTENER ACTION
-# ============================================================
-
-action = form.get("action")
-
-if not action:
-    action = URL
-
-endpoint = urljoin(
-    URL,
-    action
+print(
+    "\nFormulario de búsqueda identificado."
 )
-
-print("\nEndpoint:", endpoint)
-
-
-# ============================================================
-# CONSTRUIR DATOS DEL FORMULARIO
-# ============================================================
-
-data = {}
-
-for inp in form.find_all("input"):
-
-    name = inp.get("name")
-
-    if not name:
-        continue
-
-    input_type = (
-        inp.get("type") or "text"
-    ).lower()
-
-    value = inp.get("value", "")
-
-    if input_type in [
-        "submit",
-        "button",
-        "reset"
-    ]:
-        continue
-
-    data[name] = value
 
 
 # ============================================================
 # IDENTIFICAR CAMPOS
 # ============================================================
 
-campo_palabra = None
-campo_inicio = None
-campo_fin = None
-
-
-for inp in form.find_all("input"):
-
-    name = (
-        inp.get("name") or ""
-    ).lower()
-
-    id_ = (
-        inp.get("id") or ""
-    ).lower()
-
-    placeholder = (
-        inp.get("placeholder") or ""
-    ).lower()
-
-    identificador = (
-        name + " " +
-        id_ + " " +
-        placeholder
-    )
-
-    # Palabra clave
-    if (
-        "palabra" in identificador
-        or "keyword" in identificador
-        or "buscar" in identificador
-        or "search" in identificador
-    ):
-        campo_palabra = inp.get("name")
-
-    # Fecha inicial
-    if (
-        "inicio" in identificador
-        or "desde" in identificador
-        or "start" in identificador
-    ):
-        campo_inicio = inp.get("name")
-
-    # Fecha final
-    if (
-        "fin" in identificador
-        or "hasta" in identificador
-        or "end" in identificador
-    ):
-        campo_fin = inp.get("name")
+(
+    campo_palabra,
+    campo_inicio,
+    campo_fin
+) = identificar_campos(
+    form
+)
 
 
 print("\nCampos identificados:")
 
 print(
-    "Palabra:",
+    "Palabra clave:",
     campo_palabra
 )
 
 print(
-    "Fecha inicio:",
+    "Fecha inicial:",
     campo_inicio
 )
 
 print(
-    "Fecha fin:",
+    "Fecha final:",
     campo_fin
 )
 
 
 # ============================================================
-# SI NO SE IDENTIFICAN AUTOMÁTICAMENTE
-# MOSTRAR ERROR PARA AJUSTAR
+# VALIDAR CAMPOS
 # ============================================================
 
-if campo_palabra is None:
+if not campo_palabra:
 
-    raise Exception(
-        "No se pudo identificar el campo de palabra clave."
+    mostrar_formulario(
+        soup
     )
 
-if campo_inicio is None:
-
-    raise Exception(
-        "No se pudo identificar el campo de fecha inicial."
-    )
-
-if campo_fin is None:
-
-    raise Exception(
-        "No se pudo identificar el campo de fecha final."
+    raise RuntimeError(
+        "No se encontró el campo "
+        "de palabra clave."
     )
 
 
+if not campo_inicio:
+
+    mostrar_formulario(
+        soup
+    )
+
+    raise RuntimeError(
+        "No se encontró el campo "
+        "de fecha inicial."
+    )
+
+
+if not campo_fin:
+
+    mostrar_formulario(
+        soup
+    )
+
+    raise RuntimeError(
+        "No se encontró el campo "
+        "de fecha final."
+    )
+
+
 # ============================================================
-# COLOCAR VALORES
+# CONSTRUIR DATOS
 # ============================================================
 
-data[campo_palabra] = PALABRA_CLAVE
-
-data[campo_inicio] = FECHA_INICIAL
-
-data[campo_fin] = FECHA_FINAL
+datos = {}
 
 
-print("\nDatos de búsqueda:")
+# Recuperar campos existentes
+for elemento in form.find_all("input"):
+
+    name = elemento.get("name")
+
+    if not name:
+        continue
+
+    tipo = (
+        elemento.get("type")
+        or "text"
+    ).lower()
+
+    if tipo in (
+        "submit",
+        "button",
+        "reset"
+    ):
+        continue
+
+    datos[name] = (
+        elemento.get("value")
+        or ""
+    )
+
+
+# ============================================================
+# APLICAR FILTROS
+# ============================================================
+
+datos[campo_palabra] = PALABRA_CLAVE
+
+datos[campo_inicio] = FECHA_INICIAL
+
+datos[campo_fin] = FECHA_FINAL
+
+
+print("\n")
+print("=" * 80)
+print("FILTROS APLICADOS")
+print("=" * 80)
 
 print(
-    f"Fecha inicial: {FECHA_INICIAL}"
+    "Desde:",
+    datos[campo_inicio]
 )
 
 print(
-    f"Fecha final: {FECHA_FINAL}"
+    "Hasta:",
+    datos[campo_fin]
 )
 
 print(
-    f"Palabra clave: {PALABRA_CLAVE}"
+    "Texto:",
+    datos[campo_palabra]
+)
+
+
+# ============================================================
+# ENDPOINT
+# ============================================================
+
+action = form.get(
+    "action"
+)
+
+if not action:
+
+    action = URL
+
+
+endpoint = urljoin(
+    URL,
+    action
+)
+
+
+method = (
+    form.get("method")
+    or "GET"
+).upper()
+
+
+print(
+    "\nMétodo:",
+    method
+)
+
+print(
+    "Endpoint:",
+    endpoint
 )
 
 
@@ -312,19 +536,16 @@ print(
 # EJECUTAR BÚSQUEDA
 # ============================================================
 
-print("\nEjecutando búsqueda...")
-
-
-method = (
-    form.get("method") or "GET"
-).upper()
+print(
+    "\nEjecutando búsqueda..."
+)
 
 
 if method == "POST":
 
     resultado = session.post(
         endpoint,
-        data=data,
+        data=datos,
         timeout=30
     )
 
@@ -332,7 +553,7 @@ else:
 
     resultado = session.get(
         endpoint,
-        params=data,
+        params=datos,
         timeout=30
     )
 
@@ -341,13 +562,18 @@ resultado.raise_for_status()
 
 
 print(
-    "Búsqueda ejecutada:",
+    "Búsqueda ejecutada correctamente."
+)
+
+
+print(
+    "URL final:",
     resultado.url
 )
 
 
 # ============================================================
-# PROCESAR RESULTADOS
+# ANALIZAR RESULTADOS
 # ============================================================
 
 resultado_soup = BeautifulSoup(
@@ -357,19 +583,20 @@ resultado_soup = BeautifulSoup(
 
 
 # ============================================================
-# EXTRAER RESULTADOS
+# EXTRAER ENLACES
 # ============================================================
 
 resultados = []
 
 
-# Buscar enlaces a detalle
 for enlace in resultado_soup.find_all(
     "a",
     href=True
 ):
 
-    href = enlace.get("href")
+    href = enlace.get(
+        "href"
+    )
 
     texto = enlace.get_text(
         " ",
@@ -379,56 +606,105 @@ for enlace in resultado_soup.find_all(
     if not texto:
         continue
 
+    url_resultado = urljoin(
+        resultado.url,
+        href
+    )
+
+
+    # Ignorar enlaces internos
     if (
-        "detalle.php" in href.lower()
-        or "detalle" in href.lower()
+        url_resultado == resultado.url
     ):
-
-        url_detalle = urljoin(
-            endpoint,
-            href
-        )
-
-        resultados.append({
-            "titulo": texto,
-            "url": url_detalle
-        })
+        continue
 
 
-# Eliminar duplicados
-unicos = {}
+    # Evitar enlaces vacíos
+    if (
+        href.startswith("#")
+        or href.startswith("javascript:")
+    ):
+        continue
 
-for resultado_item in resultados:
 
-    unicos[
-        resultado_item["url"]
-    ] = resultado_item
+    resultados.append({
+        "titulo": texto,
+        "url": url_resultado
+    })
+
+
+# ============================================================
+# ELIMINAR DUPLICADOS
+# ============================================================
+
+resultados_unicos = {}
+
+for item in resultados:
+
+    resultados_unicos[
+        item["url"]
+    ] = item
 
 
 resultados = list(
-    unicos.values()
+    resultados_unicos.values()
 )
 
 
 print(
-    f"\nResultados encontrados: {len(resultados)}"
+    "\nCantidad de enlaces encontrados:",
+    len(resultados)
 )
 
 
 # ============================================================
-# OBTENER CONTENIDO DE CADA RESULTADO
+# FILTRAR POSIBLES RESULTADOS
+# ============================================================
+
+resultados_filtrados = []
+
+
+for item in resultados:
+
+    titulo = item["titulo"].lower()
+
+    url = item["url"].lower()
+
+    if (
+        PALABRA_CLAVE.lower()
+        in titulo
+        or "judicial" in url
+        or "remate" in url
+    ):
+
+        resultados_filtrados.append(
+            item
+        )
+
+
+# Si no encontramos enlaces específicos,
+# utilizamos todos los enlaces obtenidos.
+
+if not resultados_filtrados:
+
+    resultados_filtrados = resultados
+
+
+# ============================================================
+# OBTENER DETALLE
 # ============================================================
 
 resultados_completos = []
 
 
 for numero, item in enumerate(
-    resultados,
+    resultados_filtrados,
     start=1
 ):
 
     print(
-        f"Procesando {numero}/{len(resultados)}..."
+        f"\nProcesando resultado "
+        f"{numero}/{len(resultados_filtrados)}"
     )
 
     try:
@@ -445,10 +721,20 @@ for numero, item in enumerate(
             "html.parser"
         )
 
+
+        # Eliminar scripts y estilos
+        for elemento in detalle_soup(
+            ["script", "style", "noscript"]
+        ):
+
+            elemento.decompose()
+
+
         texto = detalle_soup.get_text(
             "\n",
             strip=True
         )
+
 
         resultados_completos.append({
             "titulo": item["titulo"],
@@ -456,11 +742,16 @@ for numero, item in enumerate(
             "texto": texto
         })
 
+
     except Exception as error:
 
         print(
+            "No se pudo procesar:",
+            item["url"]
+        )
+
+        print(
             "Error:",
-            item["url"],
             error
         )
 
@@ -471,114 +762,136 @@ for numero, item in enumerate(
 
 print("\n")
 print("=" * 80)
-print("RESULTADOS DE REMATES")
+print("RESULTADOS")
 print("=" * 80)
 
-for i, item in enumerate(
-    resultados_completos,
-    start=1
-):
 
-    print("\n")
-    print("=" * 80)
+if not resultados_completos:
 
     print(
-        f"RESULTADO #{i}"
+        "\nNo se encontraron resultados."
     )
 
-    print("=" * 80)
+else:
 
-    print(
-        "Título:",
-        item["titulo"]
-    )
-
-    print(
-        "URL:",
-        item["url"]
-    )
-
-    print("\n")
-
-    print(
-        item["texto"]
-    )
-
-
-# ============================================================
-# GENERAR REPORTE
-# ============================================================
-
-archivo = "resultados_remates.txt"
-
-
-with open(
-    archivo,
-    "w",
-    encoding="utf-8"
-) as f:
-
-    f.write(
-        "REPORTE DE AVISOS JUDICIALES\n"
-    )
-
-    f.write(
-        "=" * 80 + "\n\n"
-    )
-
-    f.write(
-        f"Fecha inicial: {FECHA_INICIAL}\n"
-    )
-
-    f.write(
-        f"Fecha final: {FECHA_FINAL}\n"
-    )
-
-    f.write(
-        f"Palabra clave: {PALABRA_CLAVE}\n"
-    )
-
-    f.write(
-        f"Total resultados: "
-        f"{len(resultados_completos)}\n\n"
-    )
-
-    f.write(
-        "=" * 80 + "\n"
-    )
-
-    for i, item in enumerate(
+    for numero, item in enumerate(
         resultados_completos,
         start=1
     ):
 
-        f.write(
-            f"\nRESULTADO #{i}\n"
+        print("\n")
+        print("-" * 80)
+
+        print(
+            f"RESULTADO #{numero}"
         )
 
-        f.write(
-            "-" * 80 + "\n"
+        print("-" * 80)
+
+        print(
+            "TÍTULO:",
+            item["titulo"]
         )
 
-        f.write(
-            f"Título: {item['titulo']}\n"
+        print(
+            "URL:",
+            item["url"]
         )
 
-        f.write(
-            f"URL: {item['url']}\n\n"
-        )
+        print("\n")
 
-        f.write(
+        print(
             item["texto"]
         )
 
-        f.write(
-            "\n\n"
+
+# ============================================================
+# GENERAR ARCHIVO
+# ============================================================
+
+ARCHIVO = "resultados_remates.txt"
+
+
+with open(
+    ARCHIVO,
+    "w",
+    encoding="utf-8"
+) as archivo:
+
+    archivo.write(
+        "REPORTE DE AVISOS JUDICIALES\n"
+    )
+
+    archivo.write(
+        "=" * 80
+        + "\n\n"
+    )
+
+    archivo.write(
+        f"Fecha inicial: "
+        f"{FECHA_INICIAL}\n"
+    )
+
+    archivo.write(
+        f"Fecha final: "
+        f"{FECHA_FINAL}\n"
+    )
+
+    archivo.write(
+        f"Palabra clave: "
+        f"{PALABRA_CLAVE}\n"
+    )
+
+    archivo.write(
+        f"Total resultados: "
+        f"{len(resultados_completos)}\n"
+    )
+
+    archivo.write(
+        "\n"
+    )
+
+    archivo.write(
+        "=" * 80
+        + "\n"
+    )
+
+
+    for numero, item in enumerate(
+        resultados_completos,
+        start=1
+    ):
+
+        archivo.write(
+            f"\n\nRESULTADO #{numero}\n"
+        )
+
+        archivo.write(
+            "-" * 80
+            + "\n"
+        )
+
+        archivo.write(
+            f"TÍTULO: "
+            f"{item['titulo']}\n"
+        )
+
+        archivo.write(
+            f"URL: "
+            f"{item['url']}\n\n"
+        )
+
+        archivo.write(
+            item["texto"]
+        )
+
+        archivo.write(
+            "\n"
         )
 
 
 print(
-    f"\nReporte generado: {archivo}"
+    f"\nReporte generado: {ARCHIVO}"
 )
 
 
@@ -586,30 +899,43 @@ print(
 # ENVIAR CORREO
 # ============================================================
 
-print("\nEnviando correo...")
+print(
+    "\nEnviando correo..."
+)
 
 
 mensaje = EmailMessage()
 
+
 mensaje["Subject"] = (
-    f"Remates Colombia | "
-    f"{FECHA_INICIAL} - {FECHA_FINAL}"
+    "Remates Colombia | "
+    f"{FECHA_INICIAL} - "
+    f"{FECHA_FINAL}"
 )
 
-mensaje["From"] = EMAIL_REMITENTE
 
-mensaje["To"] = EMAIL_DESTINO
+mensaje["From"] = (
+    EMAIL_REMITENTE
+)
+
+
+mensaje["To"] = (
+    EMAIL_DESTINO
+)
 
 
 mensaje.set_content(
     f"""
-Se encontraron {len(resultados_completos)}
-avisos judiciales relacionados con "{PALABRA_CLAVE}".
+REPORTE DE AVISOS JUDICIALES
 
-Rango consultado:
+Palabra clave:
+{PALABRA_CLAVE}
 
-Desde: {FECHA_INICIAL}
-Hasta: {FECHA_FINAL}
+Rango de fechas:
+{FECHA_INICIAL} al {FECHA_FINAL}
+
+Resultados encontrados:
+{len(resultados_completos)}
 
 El reporte completo se encuentra
 adjunto en este correo.
@@ -617,42 +943,73 @@ adjunto en este correo.
 )
 
 
+# ============================================================
+# ADJUNTAR REPORTE
+# ============================================================
+
 with open(
-    archivo,
+    ARCHIVO,
     "rb"
-) as f:
+) as archivo:
 
     mensaje.add_attachment(
-        f.read(),
+        archivo.read(),
         maintype="text",
         subtype="plain",
-        filename=archivo
+        filename=ARCHIVO
     )
 
 
 # ============================================================
-# SMTP GMAIL
+# ENVIAR CON GMAIL
 # ============================================================
 
-with smtplib.SMTP(
-    "smtp.gmail.com",
-    587
-) as servidor:
+try:
 
-    servidor.starttls()
+    with smtplib.SMTP(
+        "smtp.gmail.com",
+        587
+    ) as servidor:
 
-    servidor.login(
-        EMAIL_REMITENTE,
-        EMAIL_PASSWORD
+        servidor.ehlo()
+
+        servidor.starttls()
+
+        servidor.ehlo()
+
+        servidor.login(
+            EMAIL_REMITENTE,
+            EMAIL_PASSWORD
+        )
+
+        servidor.send_message(
+            mensaje
+        )
+
+
+    print(
+        "\nCorreo enviado correctamente."
     )
 
-    servidor.send_message(
-        mensaje
+
+except Exception as error:
+
+    print(
+        "\nERROR ENVIANDO CORREO:"
     )
 
+    print(
+        error
+    )
 
-print(
-    "Correo enviado correctamente."
-)
+    raise
 
-print("\nProceso terminado.")
+
+# ============================================================
+# FIN
+# ============================================================
+
+print("\n")
+print("=" * 80)
+print("PROCESO TERMINADO")
+print("=" * 80)
