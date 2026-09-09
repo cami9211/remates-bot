@@ -45,7 +45,7 @@ import sys
 from datetime import datetime
 from email.mime.text import MIMEText
 
-import requests
+
 from bs4 import BeautifulSoup
 
 # ---------------------------------------------------------------------------
