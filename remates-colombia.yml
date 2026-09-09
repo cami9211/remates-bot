@@ -1,20 +1,9 @@
-# Guarda este archivo en tu repositorio en:
-#   .github/workflows/monitor_remate.yml
-#
-# Configura los 3 secrets del repo antes de activarlo:
-#   Settings -> Secrets and variables -> Actions -> New repository secret
-#     REMATE_BOT_EMAIL           (tu correo remitente, ej. Gmail)
-#     REMATE_BOT_EMAIL_PASSWORD  (contraseña de aplicación, NO tu clave normal)
-#     REMATE_BOT_DESTINO         (correo donde quieres recibir el resultado)
-
-name: Monitor remate F.M.I. 001-850221
+name: Ejecutar bot de remates judiciales
 
 on:
   schedule:
-    # Corre todos los días a las 13:00 UTC = 08:00 hora Colombia (UTC-5).
-    # Ajusta si cambias de horario. Sintaxis: minuto hora * * *
     - cron: "0 13 * * *"
-  workflow_dispatch: {}  # permite correrlo manualmente desde la pestaña "Actions"
+  workflow_dispatch: {}
 
 jobs:
   consultar:
@@ -28,12 +17,15 @@ jobs:
         with:
           python-version: "3.11"
 
+      # --- ESTE PASO ES EL QUE PROBABLEMENTE FALTA O ESTÁ MAL ---
       - name: Instalar dependencias
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Ejecutar consulta y enviar correo
         env:
           REMATE_BOT_EMAIL: ${{ secrets.REMATE_BOT_EMAIL }}
           REMATE_BOT_EMAIL_PASSWORD: ${{ secrets.REMATE_BOT_EMAIL_PASSWORD }}
           REMATE_BOT_DESTINO: ${{ secrets.REMATE_BOT_DESTINO }}
-        run: python monitor_remate.py
+        run: python find_remates_colombia.py
