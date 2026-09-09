@@ -79,9 +79,9 @@ HEADERS = {
 # CONFIGURACIÓN DE CORREO (viene de GitHub Secrets, ver workflow .yml)
 # ---------------------------------------------------------------------------
 
-EMAIL_REMITENTE = os.environ.get("REMATE_BOT_EMAIL", "")
-EMAIL_PASSWORD = os.environ.get("REMATE_BOT_EMAIL_PASSWORD", "")
-EMAIL_DESTINATARIO = os.environ.get("REMATE_BOT_DESTINO", "")
+EMAIL_REMITENTE = os.environ.get("GMAIL_USER", "")
+EMAIL_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
+EMAIL_DESTINATARIO = os.environ.get("RECIPIENT_EMAIL", "")
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 
@@ -148,7 +148,7 @@ def buscar_coincidencias(texto_pagina):
 def enviar_correo(asunto, cuerpo):
     if not (EMAIL_REMITENTE and EMAIL_PASSWORD and EMAIL_DESTINATARIO):
         print("[AVISO] Faltan variables de entorno de correo "
-              "(REMATE_BOT_EMAIL / REMATE_BOT_EMAIL_PASSWORD / REMATE_BOT_DESTINO). "
+              "(GMAIL_USER / GMAIL_APP_PASSWORD / RECIPIENT_EMAIL). "
               "Se imprime el resultado en consola en su lugar.\n")
         print(asunto)
         print(cuerpo)
