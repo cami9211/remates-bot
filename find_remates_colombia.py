@@ -1,228 +1,343 @@
-#!/usr/bin/env python3
-"""
-find_remates_colombia.py
---------------------------
-Fuente: Avisos Judiciales de El Espectador (judiciales.elespectador.com),
-un sitio PHP clásico (no requiere JavaScript para mostrar resultados,
-a diferencia del portal de la Rama Judicial).
-
-LÉEME - MUY IMPORTANTE:
-Este sitio bloquea el acceso automatizado en su robots.txt, así que no
-se pudo inspeccionar su formulario de búsqueda desde el entorno donde
-se generó este script (sin acceso a internet y respetando ese bloqueo).
-Los nombres de parámetros de abajo (SEARCH_PARAMS_TEMPLATE) son
-PLACEHOLDERS - tienes que confirmarlos tú mismo:
-
-  1. Ve a https://judiciales.elespectador.com/ en tu navegador.
-  2. Configura el rango de fechas y escribe "remate", dale a "Buscar".
-  3. Mira la URL resultante en la barra de direcciones. Si cambió a algo
-     como ".../resultados.php?buscar=remate&fecha_ini=2026-08-10&fecha_fin=2026-09-08",
-     esos son los nombres reales de los parámetros - reemplázalos abajo.
-  4. Si la URL no cambia (el formulario usa POST), abre F12 -> Network,
-     repite la búsqueda, clic derecho sobre la petición que trae los
-     resultados -> "Copy" -> "Copy as cURL", y pégamela para que te
-     ajuste el script con los valores exactos.
-
-IMPORTANTE - USO RESPONSABLE: este sitio pide explícitamente en su
-robots.txt que no se acceda de forma automatizada. Este script consulta
-contenido público (avisos judiciales, de interés general y sin
-restricción de acceso para lectura humana normal), pero de todas formas
-conviene: (a) NO aumentar la frecuencia más allá de 1 vez al día, (b)
-revisar los Términos de Uso del sitio antes de dejarlo corriendo de
-forma permanente, y (c) estar dispuesto a detenerlo si el sitio empieza
-a bloquear la IP del runner de GitHub Actions.
-"""
-
-import os
+import time
 import smtplib
-import ssl
-import sys
+from email.message import EmailMessage
 from datetime import datetime
-from email.mime.text import MIMEText
 
-import requests
 from bs4 import BeautifulSoup
 
-# ---------------------------------------------------------------------------
-# CONFIGURACIÓN - AJUSTA ESTOS VALORES DESPUÉS DE INSPECCIONAR LA BÚSQUEDA REAL
-# ---------------------------------------------------------------------------
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
 
-BASE_URL = "https://judiciales.elespectador.com"
-SEARCH_PAGE_URL = f"{BASE_URL}/"
 
-# PLACEHOLDER: reemplaza por la URL real a la que apunta el formulario de
-# búsqueda cuando das clic en "Buscar" (revisa la barra de direcciones o
-# la pestaña Network de DevTools). Puede ser distinta a la página inicial,
-# p. ej. algo como f"{BASE_URL}/resultados.php".
-SEARCH_URL = f"{BASE_URL}/resultados.php"
+# ============================================================
+# CONFIGURACIÓN
+# ============================================================
 
-# Rango de días hacia atrás que se consulta cada vez que corre el script
-# (equivalente al selector de fechas de la captura: "Aug 10,26 - Sep 8,26").
-# Ajusta este número según qué tan seguido quieras revisar hacia atrás.
-DIAS_HACIA_ATRAS = 30
+URL = "https://judiciales.elespectador.com/"
 
-# PLACEHOLDER: reemplaza las CLAVES por los nombres reales de parámetro
-# que veas en la URL o en el payload del formulario. Los nombres de abajo
-# (buscar, fecha_ini, fecha_fin) son una suposición razonable, no confirmada.
-SEARCH_PARAMS_TEMPLATE = {
-    "buscar": "remate",
-    "fecha_ini": None,  # se rellena en tiempo de ejecución
-    "fecha_fin": None,  # se rellena en tiempo de ejecución
-}
-FORMATO_FECHA = "%Y-%m-%d"  # ajusta si el sitio espera otro formato (ej. %d/%m/%Y)
+FECHA_INICIAL = "10/08/2026"
+FECHA_FINAL = "08/09/2026"
 
-# Dirección del inmueble/proceso que te interesa resaltar dentro del
-# listado general de remates (no filtra la búsqueda, solo resalta el
-# resultado en el correo si aparece)
-PALABRAS_CLAVE = ["850221", "CALLE 5 SUR", "22-290"]
+PALABRA_CLAVE = "remate"
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "es-CO,es;q=0.9",
-}
+# Correo que recibirá el reporte
+CORREO_DESTINO = "TU_CORREO@gmail.com"
 
-# ---------------------------------------------------------------------------
-# CONFIGURACIÓN DE CORREO (viene de GitHub Secrets, ver workflow .yml)
-# ---------------------------------------------------------------------------
+# Correo desde el cual se enviará
+CORREO_REMITENTE = "TU_CORREO@gmail.com"
 
-EMAIL_REMITENTE = os.environ.get("GMAIL_USER", "")
-EMAIL_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
-EMAIL_DESTINATARIO = os.environ.get("RECIPIENT_EMAIL", "")
+# Para Gmail se recomienda utilizar una contraseña de aplicación
+CONTRASENA = "TU_CONTRASENA_DE_APLICACION"
+
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 
-
-# ---------------------------------------------------------------------------
-# LÓGICA DE CONSULTA
-# ---------------------------------------------------------------------------
-
-def construir_form_data():
-    ahora = datetime.now()
-    data = dict(FORM_DATA_TEMPLATE)
-    data["mes"] = MESES_NUM_A_TEXTO[ahora.month]
-    data["anio"] = str(ahora.year)
-    return data
+ARCHIVO_REPORTE = "resultados_remates.txt"
 
 
-def consultar_portal():
-    """
-    Intenta reproducir la consulta del portal como una petición HTTP.
-    Devuelve el texto plano de la respuesta para poder buscar palabras
-    clave en él.
-    """
-    session = requests.Session()
-    session.headers.update(HEADERS)
+# ============================================================
+# CONFIGURAR CHROME
+# ============================================================
 
-    # Paso 1: cargar la página para obtener cookies de sesión / tokens
-    resp_inicial = session.get(SEARCH_PAGE_URL, timeout=30)
-    resp_inicial.raise_for_status()
+options = webdriver.ChromeOptions()
 
-    # Si el portal requiere un token oculto (CSRF), descomenta y ajusta:
-    # sopa_inicial = BeautifulSoup(resp_inicial.text, "html.parser")
-    # token = sopa_inicial.find("input", {"name": "p_auth"})
-    # if token:
-    #     FORM_DATA_TEMPLATE["p_auth"] = token["value"]
+# Si quieres ver el navegador, deja esto comentado.
+# Si quieres que funcione en segundo plano, descoméntalo.
+# options.add_argument("--headless=new")
 
-    form_data = construir_form_data()
+options.add_argument("--start-maximized")
 
-    # Paso 2: enviar la consulta. Si POST no funciona, prueba GET:
-    # resp = session.get(SEARCH_URL, params=form_data, timeout=30)
-    resp = session.post(SEARCH_URL, data=form_data, timeout=30)
-    resp.raise_for_status()
+driver = webdriver.Chrome(
+    service=Service(ChromeDriverManager().install()),
+    options=options
+)
 
-    sopa = BeautifulSoup(resp.text, "html.parser")
-    return sopa.get_text(separator="\n")
+wait = WebDriverWait(driver, 20)
 
 
-def buscar_coincidencias(texto_pagina):
-    encontrados = []
-    texto_lower = texto_pagina.lower()
-    for palabra in PALABRAS_CLAVE:
-        idx = texto_lower.find(palabra.lower())
-        if idx != -1:
-            inicio = max(0, idx - 200)
-            fin = min(len(texto_pagina), idx + 200)
-            fragmento = texto_pagina[inicio:fin].strip()
-            encontrados.append(f"Coincidencia con '{palabra}':\n...{fragmento}...")
-    return encontrados
+# ============================================================
+# ABRIR PÁGINA
+# ============================================================
+
+print("Abriendo Avisos Judiciales...")
+
+driver.get(URL)
+
+time.sleep(3)
 
 
-# ---------------------------------------------------------------------------
-# ENVÍO DE CORREO
-# ---------------------------------------------------------------------------
+# ============================================================
+# MOSTRAR ELEMENTOS PARA DEBUG
+# ============================================================
 
-def enviar_correo(asunto, cuerpo):
-    if not (EMAIL_REMITENTE and EMAIL_PASSWORD and EMAIL_DESTINATARIO):
-        print("[AVISO] Faltan variables de entorno de correo "
-              "(GMAIL_USER / GMAIL_APP_PASSWORD / RECIPIENT_EMAIL). "
-              "Se imprime el resultado en consola en su lugar.\n")
-        print(asunto)
-        print(cuerpo)
-        return
+print("Página cargada.")
 
-    mensaje = MIMEText(cuerpo, "plain", "utf-8")
-    mensaje["Subject"] = asunto
-    mensaje["From"] = EMAIL_REMITENTE
-    mensaje["To"] = EMAIL_DESTINATARIO
-
-    contexto = ssl.create_default_context()
-    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as servidor:
-        servidor.starttls(context=contexto)
-        servidor.login(EMAIL_REMITENTE, EMAIL_PASSWORD)
-        servidor.sendmail(EMAIL_REMITENTE, EMAIL_DESTINATARIO, mensaje.as_string())
-
-    print(f"Correo enviado a {EMAIL_DESTINATARIO}")
+print("Título:", driver.title)
 
 
-# ---------------------------------------------------------------------------
-# MAIN
-# ---------------------------------------------------------------------------
+# ============================================================
+# BUSCAR INPUTS
+# ============================================================
 
-def main():
-    fecha = datetime.now().strftime("%Y-%m-%d %H:%M")
-    print(f"[{fecha}] Consultando publicaciones procesales (modo sin navegador)...")
+inputs = driver.find_elements(By.TAG_NAME, "input")
 
+print("\nInputs encontrados:")
+
+for i, elemento in enumerate(inputs):
     try:
-        texto_pagina = consultar_portal()
-        coincidencias = buscar_coincidencias(texto_pagina)
-    except Exception as exc:  # noqa: BLE001
-        asunto = "⚠️ Error en el monitor de remates - Rama Judicial"
-        cuerpo = (
-            f"La consulta automática falló el {fecha}.\n\n"
-            f"Detalle del error:\n{exc}\n\n"
-            "Causa más probable: el formulario del portal necesita "
-            "JavaScript para mostrar resultados, o cambiaron los nombres "
-            "de los campos del formulario. Revisa las instrucciones del "
-            "encabezado del script (inspección con DevTools) para ajustar "
-            "SEARCH_URL y FORM_DATA_TEMPLATE."
+        print(
+            i,
+            "type=", elemento.get_attribute("type"),
+            "name=", elemento.get_attribute("name"),
+            "id=", elemento.get_attribute("id"),
+            "placeholder=", elemento.get_attribute("placeholder")
         )
-        print(cuerpo)
-        enviar_correo(asunto, cuerpo)
-        sys.exit(1)
+    except:
+        pass
 
-    if coincidencias:
-        asunto = "🔔 Novedad encontrada - Remate F.M.I. 001-850221"
-        cuerpo = (
-            f"Consulta del {fecha}\n\n"
-            "Se encontraron coincidencias en el portal de Publicaciones "
-            "Procesales de la Rama Judicial:\n\n"
-            + "\n\n---\n\n".join(coincidencias)
-            + f"\n\nRevisa directamente en:\n{SEARCH_PAGE_URL}"
+
+# ============================================================
+# IDENTIFICAR CAMPOS
+# ============================================================
+
+# Buscamos el campo de palabra clave.
+# La página muestra un input para "Palabra clave".
+
+campo_busqueda = None
+
+for elemento in inputs:
+
+    placeholder = (
+        elemento.get_attribute("placeholder") or ""
+    ).lower()
+
+    name = (
+        elemento.get_attribute("name") or ""
+    ).lower()
+
+    elemento_id = (
+        elemento.get_attribute("id") or ""
+    ).lower()
+
+    if (
+        "palabra" in placeholder
+        or "keyword" in name
+        or "buscar" in name
+        or "search" in elemento_id
+    ):
+        campo_busqueda = elemento
+        break
+
+
+if campo_busqueda is None:
+
+    # Intento alternativo:
+    # buscar inputs de texto.
+
+    for elemento in inputs:
+
+        tipo = elemento.get_attribute("type")
+
+        if tipo == "text":
+            campo_busqueda = elemento
+            break
+
+
+if campo_busqueda is None:
+    driver.quit()
+    raise Exception(
+        "No se encontró el campo de búsqueda."
+    )
+
+
+# ============================================================
+# ESCRIBIR "REMATE"
+# ============================================================
+
+print("Escribiendo palabra clave:", PALABRA_CLAVE)
+
+campo_busqueda.click()
+
+campo_busqueda.clear()
+
+campo_busqueda.send_keys(PALABRA_CLAVE)
+
+
+# ============================================================
+# PRESIONAR ENTER
+# ============================================================
+
+print("Presionando ENTER...")
+
+campo_busqueda.send_keys(Keys.ENTER)
+
+time.sleep(5)
+
+
+# ============================================================
+# OBTENER RESULTADOS
+# ============================================================
+
+print("\nResultados cargados.")
+
+html = driver.page_source
+
+soup = BeautifulSoup(html, "html.parser")
+
+
+# ============================================================
+# EXTRAER TEXTO DE RESULTADOS
+# ============================================================
+
+texto_pagina = soup.get_text(
+    "\n",
+    strip=True
+)
+
+
+# Guardamos todo el texto visible
+with open(
+    ARCHIVO_REPORTE,
+    "w",
+    encoding="utf-8"
+) as archivo:
+
+    archivo.write(
+        "RESULTADOS AVISOS JUDICIALES\n"
+    )
+
+    archivo.write(
+        "====================================\n\n"
+    )
+
+    archivo.write(
+        f"Fecha inicial: {FECHA_INICIAL}\n"
+    )
+
+    archivo.write(
+        f"Fecha final: {FECHA_FINAL}\n"
+    )
+
+    archivo.write(
+        f"Palabra clave: {PALABRA_CLAVE}\n\n"
+    )
+
+    archivo.write(
+        "====================================\n\n"
+    )
+
+    archivo.write(
+        texto_pagina
+    )
+
+
+# ============================================================
+# IMPRIMIR RESULTADOS
+# ============================================================
+
+print("\n")
+print("=" * 70)
+print("RESULTADOS")
+print("=" * 70)
+
+print(texto_pagina)
+
+print("=" * 70)
+
+
+# ============================================================
+# ENVIAR CORREO
+# ============================================================
+
+print("\nEnviando reporte por correo...")
+
+
+mensaje = EmailMessage()
+
+mensaje["Subject"] = (
+    f"Avisos judiciales - {PALABRA_CLAVE} "
+    f"{FECHA_INICIAL} al {FECHA_FINAL}"
+)
+
+mensaje["From"] = CORREO_REMITENTE
+
+mensaje["To"] = CORREO_DESTINO
+
+
+mensaje.set_content(
+    f"""
+Resultado de búsqueda de Avisos Judiciales.
+
+Palabra clave:
+{PALABRA_CLAVE}
+
+Rango:
+{FECHA_INICIAL} - {FECHA_FINAL}
+
+El reporte completo se encuentra
+adjunto en este correo.
+"""
+)
+
+
+# Adjuntar reporte
+
+with open(
+    ARCHIVO_REPORTE,
+    "rb"
+) as archivo:
+
+    datos = archivo.read()
+
+    mensaje.add_attachment(
+        datos,
+        maintype="text",
+        subtype="plain",
+        filename=ARCHIVO_REPORTE
+    )
+
+
+# ============================================================
+# CONEXIÓN SMTP
+# ============================================================
+
+try:
+
+    with smtplib.SMTP(
+        SMTP_SERVER,
+        SMTP_PORT
+    ) as servidor:
+
+        servidor.starttls()
+
+        servidor.login(
+            CORREO_REMITENTE,
+            CONTRASENA
         )
-    else:
-        asunto = "Sin novedades - Remate F.M.I. 001-850221"
-        cuerpo = (
-            f"Consulta del {fecha}\n\n"
-            f"No se encontraron coincidencias con {PALABRAS_CLAVE} en la "
-            "respuesta del portal para el mes y año actuales."
+
+        servidor.send_message(
+            mensaje
         )
 
-    print(cuerpo)
-    enviar_correo(asunto, cuerpo)
+    print("Correo enviado correctamente.")
+
+except Exception as error:
+
+    print(
+        "Error enviando correo:",
+        error
+    )
 
 
-if __name__ == "__main__":
-    main()
+# ============================================================
+# FINALIZAR
+# ============================================================
+
+print("\nProceso terminado.")
+
+driver.quit()
